@@ -37,6 +37,11 @@ def psnr_from_mse(mse: float) -> float:
     return math.inf if mse == 0 else 10 * math.log10(255.0 ** 2 / mse)
 
 
+def log(message: str, *, file=None) -> None:
+    """Flush progress immediately, including when stdout is redirected to a file."""
+    print(f"[{time.strftime('%H:%M:%S')}] {message}", file=file, flush=True)
+
+
 @dataclass(frozen=True)
 class SearchConfig:
     keep_ratio: float = 0.8
@@ -75,20 +80,23 @@ class BlockSearch:
         return sorted(feasible, key=lambda row: (
             row["mse"], -row["macs"], len(row["blocks"]), tuple(row["blocks"])))[:top_k]
 
-    def run(self, evaluate: Callable[[tuple[int, ...]], dict], on_result=None) -> None:
+    def run(self, evaluate: Callable[[tuple[int, ...]], dict], on_result=None, on_progress=None) -> None:
         def measure(blocks):
             key = tuple(sorted(set(blocks)))
             if key in self.results:
                 return self.results[key]
             if len(self.results) >= self.config.max_evals:
                 raise RuntimeError("internal search evaluation budget exceeded")
+            saved = sum(self.candidates[block].macs for block in key)
+            remaining = self.total_macs - saved
+            if on_progress is not None:
+                on_progress(f"[{len(self.results) + 1:3d}/{self.config.max_evals}] {self.phase:<13} "
+                            f"starting keep={remaining / self.total_macs * 100:.2f}% blocks={list(key)}")
             started = time.perf_counter()
             metrics = evaluate(key)
             mse = float(metrics["mse"])
             if not math.isfinite(mse) or mse < 0:
                 raise ValueError(f"invalid MSE for blocks {key}: {mse}")
-            saved = sum(self.candidates[block].macs for block in key)
-            remaining = self.total_macs - saved
             row = dict(metrics)
             row.update(blocks=list(key), layer_indices=sorted(
                 i for block in key for i in self.candidates[block].indices),
@@ -103,6 +111,8 @@ class BlockSearch:
 
         self.stop_reason = "running"
         self.phase = "single_blocks"
+        if on_progress is not None:
+            on_progress(f"Single-block screening: {len(self.candidates)} blocks")
         for block in self.candidates:
             measure((block,))
         ranking = sorted(self.candidates, key=lambda block: (
@@ -111,6 +121,8 @@ class BlockSearch:
 
         # Measure a feasible fallback before spending the remaining budget on alternative paths.
         self.phase = "seed"
+        if on_progress is not None:
+            on_progress("Building a feasible seed from single-block sensitivity scores")
         seed, remaining = [], self.total_macs
         for block in ranking:
             seed.append(block)
@@ -121,11 +133,17 @@ class BlockSearch:
 
         self.phase = "beam"
         beam = [()]
+        depth = 0
         while beam:
+            depth += 1
             children = set()
             for parent in beam:
                 additions = [block for block in ranking if block not in parent][:self.config.expand_top_k]
                 children.update(tuple(sorted((*parent, block))) for block in additions)
+            if on_progress is not None:
+                new_count = sum(key not in self.results for key in children)
+                on_progress(f"Beam depth={depth}: paths={len(beam)}, combinations={len(children)}, "
+                            f"new={new_count}, evaluated={len(self.results)}/{self.config.max_evals}")
             next_rows = []
             for key in sorted(children):
                 if key not in self.results and len(self.results) >= self.config.max_evals:
@@ -191,19 +209,28 @@ def image_mse(a: np.ndarray, b: np.ndarray) -> float:
 
 
 class ModelEvaluator:
-    def __init__(self, net, cases: list[ImageCase], controls: Controls, candidates):
+    def __init__(self, net, cases: list[ImageCase], controls: Controls, candidates, on_progress=None):
         self.net, self.cases, self.controls, self.candidates = net, cases, controls, candidates
         self.forward_calls = {"baseline": 0, "search": 0, "ssim": 0}
+        self.on_progress = on_progress
+
+    def _log(self, message: str) -> None:
+        if self.on_progress is not None:
+            self.on_progress(message)
 
     def baseline(self, on_image=None) -> dict:
         self.net.skip = set()
         reference_error, count = 0.0, 0
-        for case in self.cases:
+        for index, case in enumerate(self.cases, 1):
+            self._log(f"Baseline image {index}/{len(self.cases)}: {case.path.name} starting")
+            started = time.perf_counter()
             self.forward_calls["baseline"] += 1
             case.full = self.net(case.frame, self.controls)
             if case.reference is not None:
                 reference_error += image_mse(case.full, case.reference) * case.frame.size
                 count += case.frame.size
+            self._log(f"Baseline image {index}/{len(self.cases)}: {case.path.name} "
+                      f"done in {time.perf_counter() - started:.2f}s")
             if on_image is not None:
                 on_image()
         result = {"mse": 0.0, "psnr_db": math.inf}
@@ -217,7 +244,9 @@ class ModelEvaluator:
         squared_error, reference_error, count = 0.0, 0.0, 0
         per_image = []
         try:
-            for case in self.cases:
+            for index, case in enumerate(self.cases, 1):
+                self._log(f"Search image {index}/{len(self.cases)}: {case.path.name} starting")
+                started = time.perf_counter()
                 self.forward_calls["search"] += 1
                 output = self.net(case.frame, self.controls)
                 mse = image_mse(output, case.full)
@@ -229,6 +258,9 @@ class ModelEvaluator:
                     reference_error += error * output.size
                     row.update(reference_mse=error, reference_psnr_db=psnr_from_mse(error))
                 per_image.append(row)
+                self._log(f"Search image {index}/{len(self.cases)}: {case.path.name} "
+                          f"MSE={mse:.6f} PSNR={row['psnr_db']:.2f}dB "
+                          f"done in {time.perf_counter() - started:.2f}s")
         finally:
             self.net.skip = set()
         result = {"mse": squared_error / count, "per_image": per_image}
@@ -240,6 +272,7 @@ class ModelEvaluator:
     def supplement_ssim(self, row: dict) -> None:
         # SSIM's reflection padding needs both image dimensions greater than five.
         if min(self.cases[0].frame.shape[:2]) <= 5:
+            self._log("SSIM skipped: image dimensions must exceed five pixels")
             row["ssim"] = None
             if self.cases[0].reference is not None:
                 row["reference_ssim"] = None
@@ -247,7 +280,9 @@ class ModelEvaluator:
         self.net.skip = set(row["layer_indices"])
         full_scores, reference_scores = [], []
         try:
-            for case, image_row in zip(self.cases, row["per_image"]):
+            for index, (case, image_row) in enumerate(zip(self.cases, row["per_image"]), 1):
+                self._log(f"SSIM image {index}/{len(self.cases)}: {case.path.name} starting")
+                started = time.perf_counter()
                 self.forward_calls["ssim"] += 1
                 output = self.net(case.frame, self.controls)
                 score = ssim(output, case.full)
@@ -257,6 +292,8 @@ class ModelEvaluator:
                     score = ssim(output, case.reference)
                     reference_scores.append(score)
                     image_row["reference_ssim"] = score
+                self._log(f"SSIM image {index}/{len(self.cases)}: {case.path.name} "
+                          f"SSIM={image_row['ssim']:.4f} done in {time.perf_counter() - started:.2f}s")
         finally:
             self.net.skip = set()
         row["ssim"] = float(np.mean(full_scores))
@@ -364,6 +401,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.top_k < 1:
             raise ValueError("--top-k must be positive")
+        log(f"Loading input images: {args.input}")
         cases = load_inputs(args.input, args.reference)
         height, width = cases[0].frame.shape[:2]
         plan = build_plan(width, height)
@@ -419,9 +457,15 @@ def main(argv: list[str] | None = None) -> int:
         write_report(output, payload)
 
     def on_result(state, row):
-        print(f"[{len(state.results):3d}/{config.max_evals}] {state.phase:<13} "
-              f"keep={row['keep_ratio'] * 100:6.2f}% PSNR={row['psnr_db']:6.2f} dB "
-              f"blocks={row['blocks']}", flush=True)
+        best = state.best_results(1)
+        best_note = (f" best_PSNR={best[0]['psnr_db']:.2f}dB" if best else "")
+        if best and best[0] is row:
+            best_note += " [new best]"
+        log(f"[{len(state.results):3d}/{config.max_evals}] {state.phase:<13} "
+            f"done keep={row['keep_ratio'] * 100:6.2f}% "
+            f"MACs={row['macs'] / 1e9:.3f}G MSE={row['mse']:.6f} PSNR={row['psnr_db']:6.2f}dB "
+            f"feasible={'yes' if row['feasible'] else 'no'} "
+            f"eval={row['evaluation_seconds']:.2f}s blocks={row['blocks']}{best_note}")
         checkpoint()
 
     exit_code = 0
@@ -429,35 +473,49 @@ def main(argv: list[str] | None = None) -> int:
         search.phase = "baseline"
         search.stop_reason = "running"
         checkpoint()
+        log(f"Loading weights and building network on {device}: {metadata['weights']}")
+        loading_started = time.perf_counter()
         net = NRNet(Weights.load(str(Path(args.weights).expanduser())), width, height).to(device)
-        evaluator = ModelEvaluator(net, cases, controls, candidates)
-        print(f"{width}x{height}, {len(cases)} image(s), {len(candidates)} skippable blocks; "
-              f"full={search.total_macs / 1e9:.3f} GMAC, target <= {config.keep_ratio * 100:.2f}%", flush=True)
+        log(f"Network ready in {time.perf_counter() - loading_started:.2f}s")
+        evaluator = ModelEvaluator(net, cases, controls, candidates, on_progress=log)
+        log(f"{width}x{height}, {len(cases)} image(s), {len(candidates)} skippable blocks; "
+            f"full={search.total_macs / 1e9:.3f} GMAC, target <= {config.keep_ratio * 100:.2f}%")
+        log("Running full-network baseline (first inference may compile kernels)")
         metadata["baseline"] = evaluator.baseline(checkpoint)
+        log("Full-network baseline complete")
         checkpoint()
-        search.run(evaluator, on_result)
+        search.run(evaluator, on_result, on_progress=log)
         search.phase = "ssim"
-        for row in search.best_results(args.top_k):
+        top_results = search.best_results(args.top_k)
+        log(f"Search stopped: {search.stop_reason}; scoring SSIM for {len(top_results)} best combinations")
+        for rank, row in enumerate(top_results, 1):
+            log(f"SSIM combination {rank}/{len(top_results)}: blocks={row['blocks']}")
             evaluator.supplement_ssim(row)
             checkpoint()
         search.phase = "done"
         status = "completed"
     except KeyboardInterrupt:
         status, search.stop_reason, exit_code = "interrupted", "interrupted", 130
-        print("Interrupted; saving completed evaluations.", file=sys.stderr)
+        log("Interrupted; saving completed evaluations.", file=sys.stderr)
     except Exception as error:
         status, search.stop_reason, exit_code = "error", "error", 1
         error_message = f"{type(error).__name__}: {error}"
-        print(error_message, file=sys.stderr)
+        log(error_message, file=sys.stderr)
     finally:
         if net is not None:
             net.skip = set()
         try:
             checkpoint()
         except OSError as error:
-            print(f"could not save report: {error}", file=sys.stderr)
+            log(f"could not save report: {error}", file=sys.stderr)
             exit_code = exit_code or 1
-    print(f"Reports: {output} and {output.with_suffix('.json')}")
+    log(f"Finished: status={status}, reason={search.stop_reason}, "
+        f"evaluated={len(search.results)}/{config.max_evals}, elapsed={time.perf_counter() - started:.2f}s")
+    best = search.best_results(1)
+    if best:
+        log(f"Best measured: keep={best[0]['keep_ratio'] * 100:.4f}% "
+            f"PSNR={best[0]['psnr_db']:.2f}dB blocks={best[0]['blocks']}")
+    log(f"Reports: {output} and {output.with_suffix('.json')}")
     return exit_code
 
 

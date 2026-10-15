@@ -165,6 +165,9 @@ The search measures all 59 single-block skips, measures a feasible fallback, the
 with a bounded beam. `--beam-width` (2) and `--expand-top-k` (6) control its breadth. Each unique evaluation
 runs every input image; `--max-evals` includes the singles and fallback and must be at least 60. Baseline
 inference and final `--top-k` (10) SSIM replays are counted separately.
+Timestamped progress is printed immediately during model loading, baseline inference, each combination
+and image evaluation, beam expansion, and final SSIM scoring. Completion logs include the current best
+feasible result and elapsed time; output is flushed when redirected to a file or piped through `tee`.
 
 The Markdown report lists the best measured combinations, block and layer indices, remaining MACs,
 PSNR and SSIM. The sibling JSON includes all evaluated combinations and per-image scores. Reports are
