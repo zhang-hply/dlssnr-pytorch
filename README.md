@@ -150,6 +150,28 @@ true. `depth`, `motion`, `history` and `reset` are accepted so that calling code
 interface, and are ignored: this version computes single frames (every frame as the first frame of a
 sequence). `net(frame, controls, capture=True)` also returns every layer's output.
 
+## Searching block pruning combinations
+
+`scripts/ablate.py` searches combinations of shape-preserving blocks to skip, with the full network's
+output as the fidelity target. The default budget retains at most 80% of the matrix multiply-adds:
+
+```bash
+python scripts/ablate.py --input frames/ --keep-ratio 0.8 --max-evals 400 --out out/ablation.md
+```
+
+`--input` accepts one image or a directory of same-size images (non-recursive). An optional `--reference`
+accepts a reference image or directory with matching filenames; these scores do not change the ranking.
+The search measures all 59 single-block skips, measures a feasible fallback, then explores combinations
+with a bounded beam. `--beam-width` (2) and `--expand-top-k` (6) control its breadth. Each unique evaluation
+runs every input image; `--max-evals` includes the singles and fallback and must be at least 60. Baseline
+inference and final `--top-k` (10) SSIM replays are counted separately.
+
+The Markdown report lists the best measured combinations, block and layer indices, remaining MACs,
+PSNR and SSIM. The sibling JSON includes all evaluated combinations and per-image scores. Reports are
+updated throughout the run, including on interruption. The search is heuristic and does not guarantee
+the best possible combination; MAC reductions do not directly predict latency reductions. This searches
+skip configurations without changing the weights. `net.skip` takes layer indices, not block numbers.
+
 ## The network
 
 71 blocks, 152 layers, 141 MB of FP8 weights, in a U-Net shape. A frame is padded to a multiple of what its
