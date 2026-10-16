@@ -28,6 +28,7 @@ from ..plan import LayerSpec
 from ..quant import q8
 from ..runtime import drain, triton_kernels
 from ..weights import Weights
+from ..training import fp16_ste, inference_forward, is_distilling, ramp_exponential, with_surrogate
 
 HEAD_DIM = 32
 KEY_GROUP = 64          # keys are summed in groups of 64 in float16, group by group
@@ -51,7 +52,7 @@ def to_map(tokens: torch.Tensor, height: int, width: int) -> torch.Tensor:
 
 def f16(x: torch.Tensor) -> torch.Tensor:
     """Round to float16 and keep going in float32."""
-    return x.to(torch.float16).to(torch.float32)
+    return fp16_ste(x) if is_distilling() else x.to(torch.float16).to(torch.float32)
 
 
 class _Matmul(nn.Module):
@@ -84,7 +85,7 @@ class VitFfnExpand(nn.Module):
         clipped = x.clamp(-4.0, 4.0)
         return x * (-0.055908203125 * clipped.abs() * clipped + 0.447265625 * clipped + 0.89453125)
 
-    @torch.no_grad()
+    @inference_forward
     def forward(self, x: torch.Tensor, skip: torch.Tensor | None = None) -> torch.Tensor:
         height, width = x.shape[-2:]
         if self.ffn is not None:
@@ -114,7 +115,7 @@ class VitFfnContract(nn.Module):
             elif int4.tables.has("vit", f"b{spec.block + 1}.ex.aq.bin"):
                 self.stash = ("stream", spec.block + 1)
 
-    @torch.no_grad()
+    @inference_forward
     def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
         height, width = x.shape[-2:]
         if self.ffn is not None:
@@ -154,6 +155,16 @@ class VitQKV(nn.Module):
     @staticmethod
     def _inverse_norm(values: torch.Tensor) -> torch.Tensor:
         """``1 / max(|x|, floor)`` over the head dimension of ``[tokens, heads, 32]`` float16 values."""
+        if is_distilling():
+            with torch.no_grad():
+                exact = VitQKV._inverse_norm_reference(values.to(torch.float16))
+            norm = torch.rsqrt(values.float().square().sum(-1, keepdim=True).clamp_min(
+                float(torch.tensor(_NORM_FLOOR, dtype=torch.float16))))
+            return with_surrogate(exact, norm)
+        return VitQKV._inverse_norm_reference(values)
+
+    @staticmethod
+    def _inverse_norm_reference(values: torch.Tensor) -> torch.Tensor:
         squares = values * values                                  # float16
         total = squares[..., :16] + squares[..., 16:]
         for half in (8, 4, 2, 1):
@@ -161,19 +172,25 @@ class VitQKV(nn.Module):
         floor = torch.tensor(_NORM_FLOOR, dtype=torch.float16)
         return torch.rsqrt(torch.maximum(total, floor).to(torch.float32)).to(torch.float16)
 
-    @torch.no_grad()
+    @inference_forward
     def forward(self, x: torch.Tensor, skip: torch.Tensor | None = None) -> torch.Tensor:
         height, width = x.shape[-2:]
         channels = self.channels
         heads = channels // HEAD_DIM
-        projected = (self.i4(int4.side[("c", self.block)]) if self.i4 is not None else self.matmul(to_tokens(x))).to(torch.float16)
+        projected = self.i4(int4.side[("c", self.block)]) if self.i4 is not None else self.matmul(to_tokens(x))
+        projected = f16(projected) if is_distilling() else projected.to(torch.float16)
         tokens = projected.shape[0]
         query, key, value = (projected[:, i * channels:(i + 1) * channels].reshape(tokens, heads, HEAD_DIM)
                              for i in range(3))
         sqrt_head = torch.tensor(math.sqrt(HEAD_DIM), dtype=torch.float16)
         temperature = self.temperature.to(torch.float16).reshape(1, heads, 1)
-        query = query * sqrt_head * self._inverse_norm(query) * temperature
-        key = key * self._inverse_norm(key)
+        if is_distilling():
+            temperature = f16(self.temperature).reshape(1, heads, 1)
+            query = f16(f16(f16(query * sqrt_head.float()) * self._inverse_norm(query)) * temperature)
+            key = f16(key * self._inverse_norm(key))
+        else:
+            query = query * sqrt_head * self._inverse_norm(query) * temperature
+            key = key * self._inverse_norm(key)
         out = torch.cat([query, key, value], dim=1).reshape(tokens, 3 * channels)
         return to_map(q8(out.to(torch.float32)), height, width)
 
@@ -191,7 +208,11 @@ def _approximate_exp(logits: torch.Tensor) -> torch.Tensor:
     mantissa = (y - 1024.0).to(torch.int64)
     exponent = (mantissa >> 6) - 15
     fraction = (mantissa & 63).to(torch.float32) / 64.0
-    return torch.ldexp(1.0 + fraction, exponent)
+    exact = torch.ldexp(1.0 + fraction, exponent)
+    if is_distilling():
+        ramp = f16(logits) * _EXP_SLOPE + _EXP_OFFSET
+        return ramp_exponential(exact, ramp, _EXP_LOW, _EXP_HIGH, 16.0)
+    return exact
 
 
 def _group_sum(probabilities: torch.Tensor) -> torch.Tensor:
@@ -201,6 +222,14 @@ def _group_sum(probabilities: torch.Tensor) -> torch.Tensor:
     other; the eight partial sums are then added as ``((p0+p2)+p4)+p6`` and ``((p1+p3)+p5)+p7`` and the two
     results are added. Every addition is a float16 addition. Input ``[..., groups, 64]`` float16.
     """
+    if is_distilling():
+        with torch.no_grad():
+            exact = _group_sum_reference(probabilities.to(torch.float16))
+        return with_surrogate(exact, probabilities.float().sum(-1))
+    return _group_sum_reference(probabilities)
+
+
+def _group_sum_reference(probabilities: torch.Tensor) -> torch.Tensor:
     blocks = probabilities.reshape(*probabilities.shape[:-1], 4, 2, 8)
     pairs = blocks[..., 0, :] + blocks[..., 1, :]
     accumulated = pairs[..., 0, :]
@@ -224,7 +253,7 @@ class VitAttention(nn.Module):
         super().__init__()
         self.channels = spec.channels
 
-    @torch.no_grad()
+    @inference_forward
     def forward(self, x: torch.Tensor, skip: torch.Tensor | None = None) -> torch.Tensor:
         height, width = x.shape[-2:]
         channels = self.channels
@@ -252,10 +281,11 @@ class VitAttention(nn.Module):
         for start in range(0, tokens, step):
             logits = torch.bmm(query[:, start:start + step], key.transpose(1, 2))      # [heads, q, keys]
             probabilities = _approximate_exp(logits)
-            sums = _group_sum(probabilities.to(torch.float16).reshape(*logits.shape[:2], -1, KEY_GROUP))
+            sums_input = f16(probabilities) if is_distilling() else probabilities.to(torch.float16)
+            sums = _group_sum(sums_input.reshape(*logits.shape[:2], -1, KEY_GROUP))
             denominator = sums[..., 0]
             for group in range(1, sums.shape[-1]):
-                denominator = denominator + sums[..., group]
+                denominator = f16(denominator + sums[..., group]) if is_distilling() else denominator + sums[..., group]
             denominator = f16(denominator.to(torch.float32) - padding)
             numerator = torch.bmm(q8(probabilities), value)                              # [heads, q, 32]
             inverse = f16(1.0 / torch.maximum(denominator, floor))

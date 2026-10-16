@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import torch
 
+from .training import is_distilling
+
 sites: set[str] = set()
 granularity = "token"           # "token" or "tensor"
 blocks: set[int] = set()        # only these blocks use int8 (empty: all)
@@ -39,6 +41,8 @@ def _activation(a: torch.Tensor) -> torch.Tensor:
 
 def mm(a: torch.Tensor, b: torch.Tensor, site: str) -> torch.Tensor:
     """``a @ b`` with ``a`` ``[..., T, K]`` and ``b`` ``[..., K, N]``."""
+    if is_distilling():
+        return a @ b
     if site in sites and (not blocks or current in blocks):
         return _activation(a) @ _weight(b)
     return a @ b

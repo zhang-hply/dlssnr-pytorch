@@ -175,6 +175,67 @@ updated throughout the run, including on interruption. The search is heuristic a
 the best possible combination; MAC reductions do not directly predict latency reductions. This searches
 skip configurations without changing the weights. `net.skip` takes layer indices, not block numbers.
 
+## Distilling a pruned model
+
+`scripts/distill.py` restores a fixed pruning mask by training all retained learned weights against the
+full model. It uses the default controls and noise seed, batch size one, FP32 master weights and exact
+inference-format rounding with surrogate gradients. The original inference path keeps its arithmetic.
+
+Split raw screenshots by game/scene into training and validation directories before preparing targets;
+identical source images cannot occur in both sets. Each cache and both sets must have matching frame
+dimensions. Images are never resized. Generate caches on the training machine: their manifests reference
+the original image paths and verify image and weight hashes. At 1080p, each float32 RGB target takes
+about 25 MB before filesystem overhead.
+
+```bash
+# Generate full-frame floating-point targets with the complete frozen teacher.
+python scripts/distill.py prepare --input data/train --out out/teacher_train --device cuda
+python scripts/distill.py prepare --input data/val --out out/teacher_val --device cuda
+
+# Use best.blocks from ablate.py's JSON report; the mask must retain <=80% MACs.
+python scripts/distill.py train --pruning-report out/ablation.json \
+  --train-cache out/teacher_train --val-cache out/teacher_val --out out/distilled --device cuda
+
+# Resume at the last completed epoch, using the same configuration and cache files.
+python scripts/distill.py train --pruning-report out/ablation.json \
+  --train-cache out/teacher_train --val-cache out/teacher_val --out out/distilled \
+  --device cuda --resume out/distilled/last.pt
+
+# Reload materialized weights through the ordinary inference graph and score them.
+python scripts/distill.py evaluate --checkpoint out/distilled/best.safetensors \
+  --cache out/teacher_val --out out/distilled/evaluation.json --device cuda
+```
+
+All commands accept `--weights` (default `weights.safetensors`). The extraction weights are still needed
+to construct the inference skeleton and must match the teacher fingerprint. The teacher targets are
+computed once, so training does not keep a teacher on the GPU. Repeating `prepare` resumes a compatible
+partial cache or reuses a complete one.
+
+Training defaults are 20 epochs, AdamW without weight decay, learning rate `1e-5` with cosine decay to
+`1e-6`, gradient accumulation over four frames, gradient clipping at 1.0 and five-epoch early stopping.
+The loss is L1 plus 0.1 times the mean horizontal/vertical edge L1. Whole-block non-reentrant activation
+checkpointing is enabled; `--no-checkpoint` disables it. A full-frame backward preflight checks gradients
+and records memory before optimizer updates; Adam's states allocate additional memory on the first
+update. Peak memory for the full run is also recorded. Training is intended for the requested 24GB GPU;
+the preflight reports actual capacity failures without changing resolution.
+
+`last.pt` and `best.pt` preserve FP32 masters, optimizer and scheduler state, the pruning mask and data
+fingerprints. `best.safetensors` plus `best.json` contain materialized buffers for ordinary `NRNet`:
+
+```python
+from dlssnr.distill_train import load_export
+
+net, metadata = load_export("weights.safetensors", "out/distilled/best.safetensors", device="cuda")
+enhanced = net(frame)  # the normal uint8 numpy interface; the pruning mask is restored automatically
+```
+
+`report.md` and `report.json` compare the pruning-only baseline with every epoch, record per-image
+validation scores and memory use, and re-evaluate the best export after loading it into the inference
+model. Float PSNR uses the unrounded [0,1] targets; uint8 PSNR and SSIM use the original frame rounding.
+The baseline remains the best artifact if training never improves validation error. Logs are flushed
+throughout preparation, training and evaluation. Interrupting preparation preserves completed targets;
+interrupting training preserves the last completed epoch.
+
 ## The network
 
 71 blocks, 152 layers, 141 MB of FP8 weights, in a U-Net shape. A frame is padded to a multiple of what its

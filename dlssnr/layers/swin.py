@@ -35,6 +35,7 @@ from ..plan import LayerSpec
 from ..quant import q8
 from ..runtime import drain, fuse, triton_kernels
 from ..weights import Weights
+from ..training import fp16_ste, inference_forward, is_distilling, ramp_exponential, with_surrogate
 
 WINDOW = 8                   # pixels along each side of an attention window
 TOKENS = WINDOW * WINDOW
@@ -55,7 +56,7 @@ _CHUNK_ELEMENTS = 1 << 22
 
 def _f16(x: torch.Tensor) -> torch.Tensor:
     """Round to the nearest f16 value (ties to even); the result stays float32."""
-    return x.to(torch.float16).to(torch.float32)
+    return fp16_ste(x) if is_distilling() else x.to(torch.float16).to(torch.float32)
 
 
 def _fma(a: torch.Tensor, b: float | torch.Tensor, c: float | torch.Tensor) -> torch.Tensor:
@@ -240,7 +241,7 @@ def _mlp(params: SwinParams, quantised: torch.Tensor, residual: torch.Tensor) ->
     return residual * params.mlp_scale + _linear(hidden, params.contract)
 
 
-def _norm_scale(values: torch.Tensor) -> torch.Tensor:
+def _norm_scale_reference(values: torch.Tensor) -> torch.Tensor:
     """Reciprocal L2 norm over the 32 head dimensions (``[..., 32] -> [...]``), float32.
 
     The squares are accumulated by fused multiply-add in float32, in four interleaved chains over each of
@@ -259,11 +260,23 @@ def _norm_scale(values: torch.Tensor) -> torch.Tensor:
     return _rsqrt(total.float())
 
 
+def _norm_scale(values: torch.Tensor) -> torch.Tensor:
+    if not is_distilling():
+        return _norm_scale_reference(values)
+    with torch.no_grad():
+        exact = _norm_scale_reference(values)
+    surrogate = torch.rsqrt(values.float().square().sum(-1).clamp_min(NORM_FLOOR))
+    return with_surrogate(exact, surrogate)
+
+
 def _softmax_numerators(logits: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
     """exp(logit + bias) as the network builds it: an affine ramp rounded to f16 and clamped, whose bit
     pattern is shifted into the exponent field. ``[n, heads, q, k]`` -> f16 tensor of the same shape."""
     ramp = _fma(logits, EXP_SLOPE, bias).to(torch.float16).clamp(EXP_LOW, EXP_HIGH)
-    return ((ramp.view(torch.int16) & 0x3FF) << 5).view(torch.float16)
+    exact = ((ramp.view(torch.int16) & 0x3FF) << 5).view(torch.float16)
+    if is_distilling():
+        return ramp_exponential(exact, logits.float() * EXP_SLOPE + bias.float(), EXP_LOW, EXP_HIGH, 32.0)
+    return exact
 
 
 def _denominator(numerators: torch.Tensor) -> torch.Tensor:
@@ -273,6 +286,14 @@ def _denominator(numerators: torch.Tensor) -> torch.Tensor:
     pairs: key = 16 block + 4 pair + 2 member + half. Blocks are added first, then pairs, then the two
     halves, then the two members of a pair.
     """
+    if is_distilling():
+        with torch.no_grad():
+            exact = _denominator_reference(numerators.to(torch.float16))
+        return with_surrogate(exact, numerators.float().sum(-1))
+    return _denominator_reference(numerators)
+
+
+def _denominator_reference(numerators: torch.Tensor) -> torch.Tensor:
     keys = numerators.reshape(*numerators.shape[:-1], 4, 4, 2, 2)           # block, pair, member, half
     blocks = ((keys[..., 0, :, :, :] + keys[..., 1, :, :, :]) + keys[..., 2, :, :, :]) + keys[..., 3, :, :, :]
     pairs = ((blocks[..., 0, :, :] + blocks[..., 1, :, :]) + blocks[..., 2, :, :]) + blocks[..., 3, :, :]
@@ -368,6 +389,10 @@ def swin_core(params: SwinParams, x: torch.Tensor, shift_x: int, shift_y: int, a
 
 @fuse
 def _pool(accumulator: torch.Tensor) -> torch.Tensor:
+    if is_distilling():
+        pairs = _f16(accumulator[..., 0::2] + accumulator[..., 1::2])
+        total = _f16(pairs[..., 0::2, :] + pairs[..., 1::2, :])
+        return q8(total * 0.25)
     pairs = (accumulator[..., 0::2] + accumulator[..., 1::2]).to(torch.float16)
     total = pairs[..., 0::2, :] + pairs[..., 1::2, :]
     return q8(total.float() * 0.25)
@@ -411,7 +436,7 @@ def downsample(params: SwinParams, resample: torch.Tensor, x: torch.Tensor, shif
 @fuse
 def _gated_sum(skip: torch.Tensor, gain: torch.Tensor, other: torch.Tensor) -> torch.Tensor:
     """``f16(skip * gain + other)`` with the product and sum taken in float64 (one rounding to f16)."""
-    return (skip.double() * gain.double() + other.double()).to(torch.float16).float()
+    return _f16(skip.double() * gain.double() + other.double())
 
 
 def upsample_blend(project: torch.Tensor, gain: torch.Tensor, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
@@ -455,7 +480,7 @@ class SwinLayer(nn.Module):
         self.register_buffer("resample", resample)
         self.register_buffer("gain", gain)
 
-    @torch.no_grad()
+    @inference_forward
     def forward(self, x: torch.Tensor, skip=None):
         spec = self.spec
         if spec.variant == "ds":

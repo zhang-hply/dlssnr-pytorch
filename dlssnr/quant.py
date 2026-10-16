@@ -8,6 +8,8 @@ float32.
 """
 import torch
 
+from .training import fp8_ste, fp16_ste, is_distilling
+
 E4M3_MAX = 448.0
 
 # Experiment hook: the blocks in ``skip_blocks`` keep their values at float16 instead of rounding them to e4m3 (the
@@ -23,6 +25,10 @@ def q8(x: torch.Tensor) -> torch.Tensor:
     Round to nearest even onto the 3-bit-mantissa grid, with the fixed 2**-9 step below 2**-6 (the
     e4m3 subnormals). Returns float32.
     """
+    if is_distilling():
+        if skip_blocks and current_block in skip_blocks:
+            return fp16_ste(x.float().clamp(-E4M3_MAX, E4M3_MAX))
+        return fp8_ste(x)
     x = x.to(torch.float32).clamp(-E4M3_MAX, E4M3_MAX)
     if skip_blocks and current_block in skip_blocks:
         return x.to(torch.float16).to(torch.float32)

@@ -9,6 +9,7 @@ from torch import nn
 from ..plan import LayerSpec
 from ..quant import q8
 from ..weights import Weights
+from ..training import inference_forward
 from .vit import _Matmul, f16, to_tokens
 
 
@@ -24,7 +25,7 @@ class DecInputUpsample(nn.Module):
         self.matmul = _Matmul(weights.e4m3(spec.block, spec.layer, "weight", spec.c_out, spec.c_in), "decoder")
         self.register_buffer("gain", weights.f16(spec.block, spec.layer, "skip_weight", spec.c_out))
 
-    @torch.no_grad()
+    @inference_forward
     def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
         """``x``: bottleneck output ``[1, 1024, hv, wv]``; ``skip``: ``[1, 512, h, w]``; returns ``[1, 512, h, w]``."""
         height, width = skip.shape[-2:]

@@ -27,6 +27,7 @@ from .. import int4, int8
 from ..plan import LayerSpec
 from ..quant import q8
 from ..weights import Weights
+from ..training import fp16_ste, inference_forward, is_distilling, ramp_exponential, with_surrogate
 
 WINDOW = 8                  # pixels per window side
 TILE = 4                    # pixels per tile side; shifts move the window grid by whole tiles
@@ -37,7 +38,7 @@ GROUPS, GROUP_IN, GROUP_HIDDEN = 8, 64, 256
 
 def _half(x: torch.Tensor) -> torch.Tensor:
     """Round to float16 and back (float32 storage)."""
-    return x.to(torch.float16).to(torch.float32)
+    return fp16_ste(x) if is_distilling() else x.to(torch.float16).to(torch.float32)
 
 
 def _store(x: torch.Tensor) -> torch.Tensor:
@@ -160,6 +161,13 @@ class SplitFfwd(nn.Module):
     @staticmethod
     def activation(x: torch.Tensor) -> torch.Tensor:
         """The cubic SiLU in float16 arithmetic: ``x * (t * (0.4473 - 0.0559 |t|) + 0.8945)``, ``t = clamp(x, +-4)``."""
+        if is_distilling():
+            x = _half(x)
+            t = x.clamp(-4.0, 4.0)
+            # The original fmas take half operands and round only once each.
+            u = _half(t.double().abs() * -0.055908203125 + 0.447265625)
+            v = _half(t.double() * u.double() + 0.89453125)
+            return _half(x * v)
         x = x.to(torch.float16)
         t = x.clamp(-4.0, 4.0)
         u = _fma_half(torch.tensor(-0.055908203125, dtype=torch.float16), t.abs(),
@@ -167,7 +175,7 @@ class SplitFfwd(nn.Module):
         v = _fma_half(t, u, torch.tensor(0.89453125, dtype=torch.float16))
         return (x * v).to(torch.float32)
 
-    @torch.no_grad()
+    @inference_forward
     def forward(self, x: torch.Tensor, skip: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
         _, _, rows, cols = x.shape
         tokens = _channels_last(x)
@@ -211,7 +219,7 @@ class SplitFfwdProj(_Projection):
         # int4: the attention's QKV quantises this projection's f16 value, so leave it for that layer
         self.stash = int4.active() and int4.tables.has("vit", f"b{spec.block}.attn.aq.bin")
 
-    @torch.no_grad()
+    @inference_forward
     def forward(self, x, skip: torch.Tensor | None = None) -> torch.Tensor:
         if isinstance(x, tuple):
             x, skip = x
@@ -224,7 +232,7 @@ class SplitFfwdProj(_Projection):
 class SplitProj(_Projection):
     """Projection of the attention output; the residual is the output of ``SplitFfwdProj`` (``skip``)."""
 
-    @torch.no_grad()
+    @inference_forward
     def forward(self, x: torch.Tensor, skip) -> torch.Tensor:
         skip = skip[0] if isinstance(skip, tuple) else skip
         return q8(self.project(x, skip))
@@ -238,9 +246,16 @@ class SplitProjPool(_Projection):
     ``ceil(extent / 2)`` padded to a multiple of 4, the padding being zero.
     """
 
-    @torch.no_grad()
+    @inference_forward
     def forward(self, x: torch.Tensor, skip) -> tuple[torch.Tensor, torch.Tensor]:
         skip = skip[0] if isinstance(skip, tuple) else skip
+        if is_distilling():
+            value = self.project(x, skip)
+            horizontal = _half(value[..., 0::2] + value[..., 1::2])
+            pooled = q8(_half(_half(horizontal[..., 0::2, :] + horizontal[..., 1::2, :]) * 0.25))
+            rows, cols = pooled.shape[-2:]
+            pooled = F.pad(pooled, (0, _pad4(cols) - cols, 0, _pad4(rows) - rows))
+            return q8(value), pooled
         value = self.project(x, skip).to(torch.float16)
         horizontal = value[..., 0::2] + value[..., 1::2]
         pooled = (horizontal[..., 0::2, :] + horizontal[..., 1::2, :]) * torch.tensor(0.25, dtype=torch.float16)
@@ -259,7 +274,7 @@ class SplitFinalHead(_Projection):
 
     has_residual = False
 
-    @torch.no_grad()
+    @inference_forward
     def forward(self, x: torch.Tensor, skip=None) -> torch.Tensor:
         pooled = skip[1] if isinstance(skip, tuple) else x
         return q8(self.project(pooled, None))
@@ -313,7 +328,13 @@ class SplitQKVAttn(nn.Module):
                       torch.tensor(cls.EXP_OFFSET, dtype=torch.float16))
         y = y.clamp(cls.EXP_LOW, cls.EXP_HIGH)
         bits = (y.view(torch.int16) & 0x3FF) << 5
-        return bits.view(torch.float16).to(torch.float32)
+        exact = bits.view(torch.float16).to(torch.float32)
+        if is_distilling():
+            # The half input rounding is straight-through; the clamp is applied
+            # to the rounded ramp, as in the reference exponential.
+            ramp = _half(logits) * cls.EXP_SLOPE + cls.EXP_OFFSET
+            return ramp_exponential(exact, ramp, cls.EXP_LOW, cls.EXP_HIGH, 32.0)
+        return exact
 
     @classmethod
     def normalise(cls, values: torch.Tensor) -> torch.Tensor:
@@ -322,6 +343,16 @@ class SplitQKVAttn(nn.Module):
         ``values``: float16 ``[..., 32]``. Squares are summed as ``d`` with ``d + 16``, then with ``d + 8``, then the
         eight results pairwise as ``(0+4, 2+6)`` and ``(1+5, 3+7)``.
         """
+        if is_distilling():
+            with torch.no_grad():
+                exact = cls._normalise_reference(values.to(torch.float16))
+            norm = torch.rsqrt(values.float().square().sum(-1, keepdim=True).clamp_min(
+                float(torch.tensor(cls.NORM_FLOOR, dtype=torch.float16))))
+            return with_surrogate(exact, values.float() * norm)
+        return cls._normalise_reference(values)
+
+    @classmethod
+    def _normalise_reference(cls, values: torch.Tensor) -> torch.Tensor:
         squares = values * values
         pairs = squares[..., :16] + squares[..., 16:]
         eights = pairs[..., :8] + pairs[..., 8:]
@@ -345,7 +376,7 @@ class SplitQKVAttn(nn.Module):
         tiles = padded.reshape(channels, rows, 2, TILE, cols, 2, TILE).permute(1, 4, 2, 5, 3, 6, 0)
         return tiles.reshape(rows * cols, WINDOW * WINDOW, channels), (rows, cols, top, left)
 
-    @torch.no_grad()
+    @inference_forward
     def forward(self, x: torch.Tensor, skip: torch.Tensor | None = None) -> torch.Tensor:
         _, channels, height, width = x.shape
         tokens, (rows, cols, top, left) = self.windows(x)
@@ -357,9 +388,14 @@ class SplitQKVAttn(nn.Module):
             qkv = (self.i4(value.reshape(-1, channels)) * inside.reshape(-1, 1)).reshape(count, 64, HEADS, 3, HEAD_DIM)
         else:
             qkv = int8.mm(tokens, self.qkv, "split").reshape(count, 64, HEADS, 3, HEAD_DIM)
-        query = self.normalise(qkv[..., 0, :].to(torch.float16))
-        key = self.normalise(qkv[..., 1, :].to(torch.float16))
-        query = q8((query * self.scale.to(torch.float16)[:, None]).to(torch.float32))
+        if is_distilling():
+            query = self.normalise(_half(qkv[..., 0, :]))
+            key = self.normalise(_half(qkv[..., 1, :]))
+            query = q8(_half(query * _half(self.scale)[:, None]))
+        else:
+            query = self.normalise(qkv[..., 0, :].to(torch.float16))
+            key = self.normalise(qkv[..., 1, :].to(torch.float16))
+            query = q8((query * self.scale.to(torch.float16)[:, None]).to(torch.float32))
         key = q8(key.to(torch.float32))
         value = _store(qkv[..., 2, :])
 

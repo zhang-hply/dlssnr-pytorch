@@ -9,6 +9,8 @@ from typing import Callable, NamedTuple
 import torch
 import torch._inductor.config
 
+from .training import is_distilling
+
 # Every matrix product accumulates in true float32: the e4m3 operands are exact in float32 and a reduced
 # precision accumulator (TF32, bfloat16 splits, f16 reductions) would move values across rounding points.
 torch.set_float32_matmul_precision("highest")
@@ -35,7 +37,7 @@ def triton_kernels(tensor: torch.Tensor) -> Kernels | None:
     They run the float16 matrix units with a float32 accumulator and fuse the rounding steps, so sums are
     taken in a different order than the float32 reference path. ``DLSSNR_TRITON=0`` selects the reference path.
     """
-    if not _TRITON or not tensor.is_cuda or torch.version.hip is None:
+    if is_distilling() or not _TRITON or not tensor.is_cuda or torch.version.hip is None:
         return None
     from . import int4
     if int4.active():                      # the int4 network is defined by the reference arithmetic
@@ -70,7 +72,7 @@ def fuse(function: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]:
     @functools.wraps(function)
     def run(first: torch.Tensor, *rest):
         nonlocal compiled
-        if not _COMPILE or not first.is_cuda:
+        if is_distilling() or not _COMPILE or not first.is_cuda:
             return function(first, *rest)
         if compiled is None:
             compiled = torch.compile(function, dynamic=True)

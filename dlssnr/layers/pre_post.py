@@ -20,6 +20,7 @@ from ..io import Controls
 from ..plan import LayerSpec
 from ..weights import Weights
 from ..runtime import fuse
+from ..training import fp16_ste, inference_forward, is_distilling
 from .swin import SwinParams, narrow, pool2x2, round8, swin_core
 
 CHANNELS = 32
@@ -31,7 +32,7 @@ OUTPUT_SCALE = 0.25   # weight of the network's residual in the output colour
 
 def _f16(x: torch.Tensor) -> torch.Tensor:
     """Round to the nearest f16 value; the result stays float32."""
-    return x.to(torch.float16).to(torch.float32)
+    return fp16_ste(x) if is_distilling() else x.to(torch.float16).to(torch.float32)
 
 
 # ---- noise ---------------------------------------------------------------------------------------------
@@ -144,6 +145,7 @@ class PreBlock(nn.Module):
         return torch.cat([self.noise(h, w, image.device), spread(constants), colour, colour,
                           spread(conditioning), spread(torch.zeros(1, device=image.device))], dim=1)
 
+    @inference_forward
     def forward(self, image: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         lifted = narrow(torch.einsum("ck,bkhw->bchw", self.lift, self.features(image)))
         wide, accumulator = swin_core(self.params, lifted, self.spec.shift_x, self.spec.shift_y, accumulator=True)
@@ -191,6 +193,7 @@ class PostBlock(nn.Module):
         up = up[:, :, :h, :w]
         return _mix(up, skip, self.main_gain, self.skip_gain)
 
+    @inference_forward
     def forward(self, x: torch.Tensor, skip: torch.Tensor, frame: torch.Tensor) -> torch.Tensor:
         wide = swin_core(self.params, self.blend(x, skip), self.spec.shift_x, self.spec.shift_y)
         residual = torch.einsum("rc,bchw->brhw", self.project, wide)
