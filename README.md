@@ -175,6 +175,21 @@ updated throughout the run, including on interruption. The search is heuristic a
 the best possible combination; MAC reductions do not directly predict latency reductions. This searches
 skip configurations without changing the weights. `net.skip` takes layer indices, not block numbers.
 
+To generate images from the best combination without rerunning the search:
+
+```bash
+python scripts/compare_ablation.py --report out/ablation.json --input frames/ \
+  --out out/ablation_comparison --device cuda
+```
+
+This saves matching PNGs in `baseline/` (complete model), `pruned/` (best dropped blocks), and
+`side_by_side/` (left: baseline, right: pruned). `comparison.json` records the block/layer mapping,
+MACs and per-image MSE/PSNR/SSIM. The report's controls are reused, and the original weights must match
+the ones used for the search (`--weights weights.safetensors` by default). Omit `--input` to replay
+the image paths recorded in the report; use it to override paths from another machine. `--report`
+also accepts `ablation.md` when its sibling JSON exists. Inputs must match the report's dimensions.
+Use a new or empty output directory; completed image pairs and their manifest survive interruption.
+
 ## Distilling a pruned model
 
 `scripts/distill.py` restores a fixed pruning mask by training all retained learned weights against the
