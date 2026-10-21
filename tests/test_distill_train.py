@@ -249,6 +249,101 @@ def test_export_checks_source_identity_and_protects_artifacts(training):
         engine.load_export(training["source"], checkpoint)
 
 
+def test_evaluation_saves_all_side_by_side_images_in_one_pass(training, monkeypatch):
+    training["val"] = training["cache"]("comparison_val", [130, 140, 150, 160])
+    report = train(training)
+    checkpoint = training["out"] / "best.safetensors"
+    images = training["out"] / "evaluation_images"
+    report_path = training["out"] / "evaluation.json"
+    callbacks, inference_calls = [], []
+    original_network = engine._new_network
+
+    def counted_network(*args):
+        net = original_network(*args)
+        original_run = net.run
+
+        def run(*args, **kwargs):
+            inference_calls.append(1)
+            return original_run(*args, **kwargs)
+
+        net.run = run
+        return net
+
+    def callback(index, name, input_frame, target_frame, output_frame):
+        callbacks.append((name, np.concatenate((input_frame, target_frame, output_frame), axis=1)))
+
+    monkeypatch.setattr(engine, "_new_network", counted_network)
+    result = engine.evaluate_export(training["source"], checkpoint, training["val"], report_path, "cpu",
+                                    log=lambda _: None, images_out=images, on_image=callback)
+    assert len(inference_calls) == len(callbacks) == 4
+    assert result["metrics"]["mse"] == report["export_validation"]["mse"]
+    manifest = json.loads((images / "comparison.json").read_text())
+    assert manifest == result["comparisons"] == json.loads(report_path.read_text())["comparisons"]
+    assert manifest["status"] == "completed"
+    assert manifest["side_by_side_order"] == ["input", "teacher", "student"]
+    assert len(manifest["images"]) == len(list(images.glob("*.png"))) == 4
+    for index, (row, (name, expected)) in enumerate(zip(manifest["images"], callbacks)):
+        assert row["name"] == name == f"{index}.png"
+        with Image.open(images / row["file"]) as image:
+            assert image.format == "PNG" and image.size == (12, 3)
+            pixels = np.asarray(image)
+        assert np.array_equal(pixels, expected)
+        assert np.all(pixels[:, :4] == 130 + index * 10)
+        assert np.all(pixels[:, 4:8] == 104 + index * 8)
+    assert not list(images.glob("*.tmp"))
+
+
+@pytest.mark.parametrize("conflict", ["nonempty", "input", "report_manifest", "report_png", "report_directory"])
+def test_evaluation_comparisons_reject_output_conflicts_before_inference(training, monkeypatch, conflict):
+    train(training)
+    checkpoint = training["out"] / "best.safetensors"
+    images = training["out"] / "evaluation_images"
+    report_path = None
+    if conflict == "nonempty":
+        images.mkdir()
+        (images / "keep.txt").write_text("keep")
+    elif conflict == "input":
+        images = training["val"].parent / "val_images"
+    elif conflict == "report_manifest":
+        report_path = images / "comparison.json"
+    elif conflict == "report_png":
+        report_path = images / "000000_0.png"
+    else:
+        report_path = images
+
+    def unexpected_load(*args, **kwargs):
+        pytest.fail("Output conflicts must be rejected before loading the model")
+
+    monkeypatch.setattr(engine, "load_export", unexpected_load)
+    with pytest.raises(ValueError, match="empty directory|overwrite comparison"):
+        engine.evaluate_export(training["source"], checkpoint, training["val"], report_path, "cpu",
+                               log=lambda _: None, images_out=images)
+    if conflict == "nonempty":
+        assert (images / "keep.txt").read_text() == "keep"
+    elif conflict == "input":
+        with Image.open(images / "0.png") as image:
+            assert np.all(np.asarray(image) == 130)
+    else:
+        assert not images.exists()
+
+
+def test_evaluation_interruption_preserves_completed_comparisons(training):
+    train(training)
+    images = training["out"] / "evaluation_images"
+
+    def interrupt(*args):
+        raise KeyboardInterrupt("stop after first comparison")
+
+    with pytest.raises(KeyboardInterrupt):
+        engine.evaluate_export(training["source"], training["out"] / "best.safetensors", training["val"],
+                               device="cpu", log=lambda _: None, images_out=images, on_image=interrupt)
+    manifest = json.loads((images / "comparison.json").read_text())
+    assert manifest["status"] == "interrupted" and len(manifest["images"]) == 1
+    with Image.open(images / manifest["images"][0]["file"]) as image:
+        image.verify()
+    assert not list(images.glob("*.tmp"))
+
+
 @pytest.mark.parametrize("override", [{"epochs": 0}, {"accumulation": 0}, {"patience": 0},
                                      {"learning_rate": float("nan")}, {"grad_clip": 0},
                                      {"min_learning_rate": 0.1}])

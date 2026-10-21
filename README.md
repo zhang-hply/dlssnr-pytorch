@@ -221,6 +221,19 @@ python scripts/distill.py evaluate --checkpoint out/distilled/best.safetensors \
   --cache out/teacher_val --out out/distilled/evaluation.json --device cuda
 ```
 
+`evaluate` also saves a full-resolution side-by-side PNG for **every** validation image. The columns
+are **input | cached full-model teacher | distilled student**, from left to right, with no resizing.
+For the command above, PNGs are written to `out/distilled/evaluation_images/`; `comparison.json` in
+that directory maps each numbered PNG to its input filename and records the column order and status.
+The evaluation JSON also includes this comparison manifest. All images reuse the scoring inference
+pass, and completed PNGs are preserved if evaluation is interrupted.
+
+Use `--images-out PATH` to choose a new or empty directory, or `--no-images` to produce only metrics.
+By default the image directory is `<report stem>_images` beside `--out`; when `--out` is omitted it is
+`evaluation_images` beside the checkpoint. Existing nonempty image directories are rejected, so use
+a different directory when comparing another checkpoint. Training's per-epoch validation continues
+to use the TensorBoard image settings described below.
+
 All commands accept `--weights` (default `weights.safetensors`). The extraction weights are still needed
 to construct the inference skeleton and must match the teacher fingerprint. The teacher targets are
 computed once, so training does not keep a teacher on the GPU. Repeating `prepare` resumes a compatible

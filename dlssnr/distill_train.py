@@ -11,6 +11,7 @@ import tempfile
 import time
 
 import numpy as np
+from PIL import Image
 import torch
 from safetensors.torch import load_file, save_file
 
@@ -199,7 +200,12 @@ def load_export(weights_path, checkpoint_path, device="cpu"):
 
 
 def evaluate_export(weights_path, checkpoint_path, cache_dir, out_path=None, device="auto", log=print,
-                    *, on_image=None) -> dict:
+                    *, on_image=None, images_out=None) -> dict:
+    """Evaluate an export, optionally saving full-resolution input/teacher/student PNGs.
+
+    images_out must be a new or empty directory. The image callback still receives
+    every frame when disk comparisons are enabled; neither output needs extra inference.
+    """
     # Validate all artifacts before moving the model to the device.
     source = Path(weights_path).expanduser().resolve()
     dataset = CachedFrames(cache_dir, weights_hash=file_sha256(source))
@@ -212,10 +218,53 @@ def evaluate_export(weights_path, checkpoint_path, cache_dir, out_path=None, dev
         protected.update((dataset.root / entry["target"]).resolve() for entry in dataset.entries)
         if destination in protected:
             raise ValueError("evaluation report would overwrite an input artifact")
+    images_root, comparisons = None, None
+    if images_out is not None:
+        images_root = Path(images_out).expanduser().resolve()
+        if images_root.exists() and (not images_root.is_dir() or any(images_root.iterdir())):
+            raise ValueError("evaluation images output must be a new or empty directory; choose another --images-out")
+        filenames = [f"{index:06d}_{Path(entry['name']).stem}.png"
+                     for index, entry in enumerate(dataset.entries)]
+        image_artifacts = {images_root / name for name in filenames} | {images_root / "comparison.json"}
+        if destination is not None and (destination in image_artifacts or destination == images_root
+                                        or destination in images_root.parents):
+            raise ValueError("evaluation report would overwrite comparison output")
     net, metadata = load_export(source, checkpoint_path)
     if (dataset.width, dataset.height) != (metadata["width"], metadata["height"]):
         raise ValueError("evaluation cache dimensions differ from the distilled model")
-    result = {"metadata": metadata, "metrics": evaluate_network(net, dataset, device, log, on_image=on_image)}
+    if images_root is not None:
+        images_root.mkdir(parents=True, exist_ok=True)
+        comparisons = {"status": "running", "directory": str(images_root),
+                       "checkpoint": str(Path(checkpoint_path).expanduser().resolve()),
+                       "side_by_side_order": ["input", "teacher", "student"], "images": []}
+        _write_json(images_root / "comparison.json", comparisons)
+        log(f"Saving evaluation comparisons to {images_root}: input | teacher | student")
+
+    def record_image(index, name, input_frame, target_frame, output_frame):
+        if images_root is not None:
+            path = images_root / filenames[index]
+            pixels = np.concatenate((input_frame, target_frame, output_frame), axis=1)
+            _atomic_write(path, lambda temporary: Image.fromarray(pixels).save(temporary, format="PNG"))
+            comparisons["images"].append({"name": name, "file": path.name})
+            _write_json(images_root / "comparison.json", comparisons)
+            log(f"Comparison {index + 1}/{len(dataset)} saved: {path}")
+        if on_image is not None:
+            on_image(index, name, input_frame, target_frame, output_frame)
+
+    try:
+        metrics = evaluate_network(net, dataset, device, log,
+                                   on_image=record_image if images_root is not None else on_image)
+    except (Exception, KeyboardInterrupt) as error:
+        if comparisons is not None:
+            comparisons["status"] = "interrupted" if isinstance(error, KeyboardInterrupt) else "error"
+            comparisons["error"] = f"{type(error).__name__}: {error}"
+            _write_json(images_root / "comparison.json", comparisons)
+        raise
+    result = {"metadata": metadata, "metrics": metrics}
+    if comparisons is not None:
+        comparisons["status"] = "completed"
+        _write_json(images_root / "comparison.json", comparisons)
+        result["comparisons"] = comparisons
     if destination is not None:
         _write_json(destination, result)
     return result

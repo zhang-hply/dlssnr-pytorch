@@ -59,17 +59,26 @@ def test_train_dispatches_default_and_custom_configuration(monkeypatch, custom, 
     assert "best epoch=2" in capsys.readouterr().out
 
 
-def test_evaluate_dispatches_and_prints_metrics(monkeypatch, capsys):
+@pytest.mark.parametrize("extra,report_path,expected_images", [
+    ([], "evaluation.json", "evaluation_images"),
+    (["--images-out", "comparisons"], "evaluation.json", "comparisons"),
+    (["--no-images"], "evaluation.json", None),
+    ([], None, "evaluation_images"),
+])
+def test_evaluate_dispatches_and_prints_metrics(monkeypatch, capsys, extra, report_path, expected_images):
     calls = []
 
-    def evaluate(*arguments):
+    def evaluate(*arguments, **options):
         calls.append(arguments)
+        assert options == {"images_out": expected_images}
         return {"metrics": {"psnr_db": 40.1, "psnr_uint8_db": 40.2, "ssim": None}}
 
     monkeypatch.setattr(distill, "evaluate_export", evaluate)
-    assert distill.main(["evaluate", "--checkpoint", "best.safetensors", "--cache", "val",
-                         "--out", "evaluation.json", "--device", "cpu"]) == 0
-    assert calls[0][:-1] == ("weights.safetensors", "best.safetensors", "val", "evaluation.json", "cpu")
+    arguments = ["evaluate", "--checkpoint", "best.safetensors", "--cache", "val", "--device", "cpu"] + extra
+    if report_path is not None:
+        arguments += ["--out", report_path]
+    assert distill.main(arguments) == 0
+    assert calls[0][:-1] == ("weights.safetensors", "best.safetensors", "val", report_path, "cpu")
     output = capsys.readouterr().out
     assert "PSNR=40.1000dB" in output and "SSIM=None" in output
 
@@ -91,6 +100,8 @@ def test_known_failures_return_exit_code_and_actionable_error(monkeypatch, capsy
 
 
 @pytest.mark.parametrize("arguments", [[], ["prepare"], ["train"], ["evaluate"],
+                                      ["evaluate", "--checkpoint", "best.safetensors", "--cache", "val",
+                                       "--images-out", "images", "--no-images"],
                                       ["train", "--epochs", "not-a-number"]])
 def test_missing_or_invalid_arguments_fail_before_dispatch(arguments):
     with pytest.raises(SystemExit) as caught:

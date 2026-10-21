@@ -13,6 +13,7 @@ gradient accumulation and whole-block checkpointing. Training does not resize im
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 import sys
 import time
 
@@ -52,6 +53,10 @@ def main(argv=None) -> int:
     evaluate.add_argument("--checkpoint", required=True, help="exported safetensors plus its sibling JSON metadata")
     evaluate.add_argument("--cache", required=True)
     evaluate.add_argument("--out", help="optional JSON report")
+    images = evaluate.add_mutually_exclusive_group()
+    images.add_argument("--images-out", help="new or empty comparison directory; default: <out stem>_images, "
+                        "or evaluation_images beside the checkpoint when --out is omitted")
+    images.add_argument("--no-images", action="store_true", help="evaluate metrics without saving comparison PNGs")
     for command in (prepare, train, evaluate):
         command.add_argument("--weights", default="weights.safetensors")
         command.add_argument("--device", default="auto")
@@ -70,9 +75,19 @@ def main(argv=None) -> int:
                 f"export PSNR={report['export_validation']['psnr_db']:.4f}dB, "
                 f"improved={report['improved']}; reports: {args.out}")
         else:
-            result = evaluate_export(args.weights, args.checkpoint, args.cache, args.out, args.device, log)
+            images_out = None
+            if not args.no_images:
+                images_out = args.images_out
+                if images_out is None:
+                    images_out = (Path(args.out).with_name(Path(args.out).stem + "_images") if args.out
+                                  else Path(args.checkpoint).parent / "evaluation_images")
+                images_out = str(images_out)
+            result = evaluate_export(args.weights, args.checkpoint, args.cache, args.out, args.device, log,
+                                     images_out=images_out)
             log(f"Export evaluation: PSNR={result['metrics']['psnr_db']:.4f}dB, "
                 f"uint8 PSNR={result['metrics']['psnr_uint8_db']:.4f}dB, SSIM={result['metrics']['ssim']}")
+            if result.get("comparisons"):
+                log(f"Comparison images: {result['comparisons']['directory']} (input | teacher | student)")
         return 0
     except KeyboardInterrupt:
         print("Interrupted. Completed cache frames and epoch-boundary checkpoints are preserved.", file=sys.stderr, flush=True)
