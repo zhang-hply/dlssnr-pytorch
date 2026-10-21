@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, replace
+import io
 import json
 from pathlib import Path
 
@@ -270,3 +271,180 @@ def test_deployment_evaluation_rejects_alternate_arithmetic(training, monkeypatc
         monkeypatch.setattr(quant, "skip_blocks", {2})
     with pytest.raises(ValueError, match="disable INT4, INT8"):
         engine.load_export(training["source"], training["out"] / "best.safetensors")
+
+
+@pytest.fixture
+def events():
+    accumulator = pytest.importorskip("tensorboard.backend.event_processing.event_accumulator")
+
+    def read(directory):
+        return accumulator.EventAccumulator(str(directory / "tensorboard"),
+                                           size_guidance={"scalars": 0, "images": 0, "tensors": 0}).Reload()
+
+    return read
+
+
+def test_tensorboard_records_metrics_groups_and_original_images(training, monkeypatch, events):
+    training["val"] = training["cache"]("visual_validation", [130, 140, 150, 160])
+    losses, inference_calls = [], []
+    original_loss, original_network = engine.distillation_loss, engine._new_network
+
+    def record_loss(prediction, target):
+        loss = original_loss(prediction, target)
+        if torch.is_grad_enabled():
+            losses.append(float(loss.detach()))
+        return loss
+
+    def record_network(*args):
+        net = original_network(*args)
+        original_run = net.run
+
+        def run(*args, **kwargs):
+            inference_calls.append(1)
+            return original_run(*args, **kwargs)
+
+        net.run = run
+        return net
+
+    monkeypatch.setattr(engine, "distillation_loss", record_loss)
+    monkeypatch.setattr(engine, "_new_network", record_network)
+    report = train(training, tensorboard=True, config=replace(training["config"], grad_clip=0.01))
+    result = events(training["out"])
+    steps = result.Scalars("train/loss_step")
+    assert [event.step for event in steps] == [1, 2, 3, 4]
+    # Ignore preflight and average each real accumulation group, including single-frame tails.
+    assert [event.value for event in steps] == pytest.approx(
+        [sum(losses[1:3]) / 2, losses[3], sum(losses[4:6]) / 2, losses[6]])
+    assert all(event.value > 0.01 for event in result.Scalars("train/grad_norm"))
+    assert [event.value for event in result.Scalars("train/learning_rate")] == pytest.approx(
+        [row["learning_rate"] for row in report["history"] for _ in range(2)])
+    assert [event.value for event in result.Scalars("train/loss_epoch")] == pytest.approx(
+        [row["loss"] for row in report["history"]])
+    for key in ("loss", "mse", "psnr_db", "mse_uint8", "psnr_uint8_db"):
+        actual = result.Scalars(f"val/{key}")
+        assert [event.step for event in actual] == [0, 2, 4]
+        assert [event.value for event in actual] == pytest.approx(
+            [report["baseline"][key]] + [row["validation"][key] for row in report["history"]])
+        final = result.Scalars(f"final/{key}")
+        assert [event.step for event in final] == [4]
+        assert final[0].value == pytest.approx(report["export_validation"][key])
+    assert "val/ssim" not in result.Tags()["scalars"]
+    assert result.Scalars("best/mse")[-1].value == pytest.approx(report["best"]["mse"])
+    assert result.Scalars("train/epoch")[-1].value == 2
+    assert len(inference_calls) == 16  # Four frames: baseline, two epochs, final export.
+    assert training["students"][0].forward_calls == 7  # Preflight plus six training frames.
+    assert set(result.Tags()["images"]) == {
+        f"{prefix}/images/{index:03d}" for prefix in ("val", "final") for index in range(3)}
+    images = result.Images("val/images/000")
+    assert [event.step for event in images] == [0, 2, 4]
+    with Image.open(io.BytesIO(images[0].encoded_image_string)) as image:
+        pixels = np.asarray(image)
+    assert pixels.shape == (3, 12, 3)
+    assert np.all(pixels[:, :4] == 130)  # Input, unchanged native resolution.
+    assert np.all(pixels[:, 4:8] == 104)  # Teacher = 0.8 * input.
+    assert np.all(pixels[:, 8:] == 65)  # Pruning-only student = 0.5 * input.
+    description = result.Tensors("val/images/000/description/text_summary")[0].tensor_proto.string_val[0]
+    assert b"0.png" in description and b"input | teacher | student" in description
+
+
+def test_tensorboard_resume_hides_abandoned_updates(training, events):
+    reference_dir = training["out"].parent / "continuous"
+    reference = train(training, out_dir=reference_dir)
+    training["student_class"].interrupt_forward = 7  # Epoch 2 already wrote optimizer step 3.
+    with pytest.raises(KeyboardInterrupt):
+        train(training, tensorboard=True)
+    assert [e.step for e in events(training["out"]).Scalars("train/loss_step")] == [1, 2, 3]
+    checkpoint = torch.load(training["out"] / "last.pt", weights_only=True)
+    assert checkpoint["report"]["global_step"] == 2
+    training["student_class"].interrupt_forward = None
+    resumed = train(training, tensorboard=True, resume=training["out"] / "last.pt")
+    result = events(training["out"])
+    assert [e.step for e in result.Scalars("train/loss_step")] == [1, 2, 3, 4]
+    assert [e.step for e in result.Scalars("val/mse")] == [0, 2, 4]
+    assert [e.step for e in result.Images("val/images/000")] == [0, 2, 4]
+    expected = torch.load(reference_dir / "last.pt", weights_only=True)
+    actual = torch.load(training["out"] / "last.pt", weights_only=True)
+    assert torch.equal(actual["student_state"]["gain"], expected["student_state"]["gain"])
+    assert resumed["export_validation"]["mse"] == reference["export_validation"]["mse"]
+
+
+def test_tensorboard_can_start_when_resuming_legacy_checkpoint(training, events):
+    training["student_class"].interrupt_forward = 5
+    with pytest.raises(KeyboardInterrupt):
+        train(training)
+    checkpoint_path = training["out"] / "last.pt"
+    checkpoint = torch.load(checkpoint_path, weights_only=True)
+    # Old schema-v1 reports predate validation loss and TensorBoard.
+    for metrics in [checkpoint["report"]["baseline"], checkpoint["report"]["best"]] + [
+            row["validation"] for row in checkpoint["report"]["history"]]:
+        metrics.pop("loss", None)
+    torch.save(checkpoint, checkpoint_path)
+    training["student_class"].interrupt_forward = None
+    train(training, tensorboard=True, resume=checkpoint_path)
+    result = events(training["out"])
+    assert [e.step for e in result.Scalars("train/loss_step")] == [3, 4]
+    assert [e.step for e in result.Scalars("val/loss")] == [4]
+    assert [e.step for e in result.Images("val/images/000")] == [4]
+
+
+@pytest.mark.parametrize("failure", [None, KeyboardInterrupt("stop"), RuntimeError("failed forward")])
+def test_tensorboard_closes_on_success_and_preflight_failure(training, monkeypatch, events, failure):
+    writer_type = engine.load_summary_writer()
+    writers = []
+
+    class TrackingWriter(writer_type):
+        closed = False
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            writers.append(self)
+
+        def close(self):
+            super().close()
+            self.closed = True
+
+    monkeypatch.setattr(engine, "load_summary_writer", lambda: TrackingWriter)
+    if failure is None:
+        train(training, tensorboard=True)
+    else:
+        def fail(*args):
+            raise failure
+
+        monkeypatch.setattr(training["student_class"], "forward", fail)
+        with pytest.raises(type(failure), match=str(failure)):
+            train(training, tensorboard=True)
+    assert len(writers) == 1 and writers[0].closed
+    result = events(training["out"])
+    assert result.Scalars("val/mse")[0].step == 0
+    if failure is not None:
+        assert "train/loss_step" not in result.Tags()["scalars"]
+
+
+def test_tensorboard_missing_dependency_only_fails_when_enabled(training, monkeypatch):
+    import builtins
+
+    original_import = builtins.__import__
+
+    def without_tensorboard(name, *args, **kwargs):
+        if name == "torch.utils.tensorboard":
+            raise ImportError("simulated missing tensorboard")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", without_tensorboard)
+    with pytest.raises(RuntimeError, match="uv pip install tensorboard"):
+        train(training, tensorboard=True)
+    assert not training["students"] and not training["out"].exists()
+    train(training)
+    assert not (training["out"] / "tensorboard").exists()
+
+
+def test_tensorboard_infinite_psnr_is_text_and_ssim_none_is_omitted(training, monkeypatch, events):
+    monkeypatch.setattr(training["student_class"], "export_state", lambda self: {"gain": torch.tensor(0.8)})
+    report = train(training, tensorboard=True)
+    result = events(training["out"])
+    assert report["baseline"]["psnr_db"] == float("inf")
+    assert result.Scalars("val/mse")[0].value == 0
+    assert "val/psnr_db" not in result.Tags()["scalars"]
+    assert "val/ssim" not in result.Tags()["scalars"]
+    text = result.Tensors("val/psnr_db/nonfinite/text_summary")[0].tensor_proto.string_val[0]
+    assert text == b"inf"

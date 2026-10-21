@@ -6,6 +6,7 @@ import json
 import math
 import os
 from pathlib import Path
+import sys
 import tempfile
 import time
 
@@ -14,6 +15,7 @@ import torch
 from safetensors.torch import load_file, save_file
 
 from .distill_data import CachedFrames, file_sha256
+from .distill_logging import image_callback, load_summary_writer, write_metrics, write_scalar
 from .distillation import DistilledStudent, read_pruning_report, require_reference, validate_pruning
 from .io import Controls, frame_to_tensor, tensor_to_frame
 from .metrics import ssim
@@ -102,11 +104,12 @@ def _check_data(train: CachedFrames, validation: CachedFrames) -> None:
         raise ValueError("training and validation contain identical source images; split by scene first")
 
 
-def evaluate_network(net, dataset: CachedFrames, device="auto", log=print) -> dict:
+def evaluate_network(net, dataset: CachedFrames, device="auto", log=print, *, on_image=None) -> dict:
     """Score the ordinary inference graph against float targets and their 8-bit frames."""
     require_reference(net)
     device = resolve_device(str(device))
     squared, byte_squared, elements = 0.0, 0.0, 0
+    loss_sum = 0.0
     structures, per_image = [], []
     started = time.perf_counter()
     clear_caches()
@@ -127,6 +130,8 @@ def evaluate_network(net, dataset: CachedFrames, device="auto", log=print) -> di
                 if prediction.shape != target.shape or not torch.isfinite(prediction).all().item():
                     raise ValueError("inference returned an invalid image")
                 mse = float((prediction.double() - target.double()).square().mean())
+                loss = float(distillation_loss(prediction, target))
+                loss_sum += loss
                 output_frame = tensor_to_frame(prediction, dataset.width, dataset.height)
                 target_frame = tensor_to_frame(target, dataset.width, dataset.height)
                 byte_mse = float(np.square(output_frame.astype(np.float64) - target_frame.astype(np.float64)).mean())
@@ -136,18 +141,20 @@ def evaluate_network(net, dataset: CachedFrames, device="auto", log=print) -> di
                 squared += mse * target.numel()
                 byte_squared += byte_mse * target.numel()
                 elements += target.numel()
-                per_image.append({"name": item["name"], "mse": mse, "psnr_db": _psnr(mse),
+                per_image.append({"name": item["name"], "loss": loss, "mse": mse, "psnr_db": _psnr(mse),
                                   "mse_uint8": byte_mse, "psnr_uint8_db": _psnr(byte_mse, 255),
                                   "ssim": structure, "seconds": time.perf_counter() - image_started})
                 log(f"Validation {index + 1}/{len(dataset)}: MSE={mse:.8g}, "
                     f"PSNR={_psnr(mse):.2f}dB, uint8 PSNR={_psnr(byte_mse, 255):.2f}dB")
+                if on_image is not None:
+                    on_image(index, item["name"], item["input"], target_frame, output_frame)
                 del outputs, value, image
     finally:
         net.to("cpu")
         clear_caches()
         if device.type == "cuda":
             torch.cuda.empty_cache()
-    return {"mse": squared / elements, "psnr_db": _psnr(squared / elements),
+    return {"loss": loss_sum / len(dataset), "mse": squared / elements, "psnr_db": _psnr(squared / elements),
             "mse_uint8": byte_squared / elements, "psnr_uint8_db": _psnr(byte_squared / elements, 255),
             "ssim": float(np.mean(structures)) if structures else None,
             "seconds": time.perf_counter() - started, "per_image": per_image}
@@ -191,7 +198,8 @@ def load_export(weights_path, checkpoint_path, device="cpu"):
     return net.to(resolve_device(str(device))).eval(), metadata
 
 
-def evaluate_export(weights_path, checkpoint_path, cache_dir, out_path=None, device="auto", log=print) -> dict:
+def evaluate_export(weights_path, checkpoint_path, cache_dir, out_path=None, device="auto", log=print,
+                    *, on_image=None) -> dict:
     # Validate all artifacts before moving the model to the device.
     source = Path(weights_path).expanduser().resolve()
     dataset = CachedFrames(cache_dir, weights_hash=file_sha256(source))
@@ -207,7 +215,7 @@ def evaluate_export(weights_path, checkpoint_path, cache_dir, out_path=None, dev
     net, metadata = load_export(source, checkpoint_path)
     if (dataset.width, dataset.height) != (metadata["width"], metadata["height"]):
         raise ValueError("evaluation cache dimensions differ from the distilled model")
-    result = {"metadata": metadata, "metrics": evaluate_network(net, dataset, device, log)}
+    result = {"metadata": metadata, "metrics": evaluate_network(net, dataset, device, log, on_image=on_image)}
     if destination is not None:
         _write_json(destination, result)
     return result
@@ -233,12 +241,13 @@ def _write_training_report(destination: Path, report: dict) -> None:
         lines += [f"Best exported result: PSNR={best['psnr_db']:.4f} dB, "
                   f"uint8 PSNR={best['psnr_uint8_db']:.4f} dB; "
                   f"improved over pruning-only baseline: {improved}", ""]
-    lines += ["| Epoch | Training loss | Validation MSE | Float PSNR | uint8 PSNR | SSIM | Learning rate |",
-              "| --- | ---: | ---: | ---: | ---: | ---: | ---: |"]
+    lines += ["| Epoch | Training loss | Validation loss | Validation MSE | Float PSNR | uint8 PSNR | SSIM | Learning rate |",
+              "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"]
     for epoch in report["history"]:
         metrics = epoch["validation"]
         structure = "N/A" if metrics["ssim"] is None else f"{metrics['ssim']:.6f}"
-        lines.append(f"| {epoch['epoch']} | {epoch['loss']:.8g} | {metrics['mse']:.8g} | "
+        validation_loss = "N/A" if metrics.get("loss") is None else f"{metrics['loss']:.8g}"
+        lines.append(f"| {epoch['epoch']} | {epoch['loss']:.8g} | {validation_loss} | {metrics['mse']:.8g} | "
                      f"{metrics['psnr_db']:.4f} | {metrics['psnr_uint8_db']:.4f} | "
                      f"{structure} | {epoch['learning_rate']:.8g} |")
     lines += ["", f"Peak GPU allocation: {report.get('peak_memory_bytes', 0) / 2**30:.3f} GiB",
@@ -249,10 +258,12 @@ def _write_training_report(destination: Path, report: dict) -> None:
 
 
 def train_distillation(weights_path, pruning_report, train_cache, val_cache, out_dir,
-                       device="auto", config: TrainConfig | None = None, resume=None, log=print) -> dict:
+                       device="auto", config: TrainConfig | None = None, resume=None, log=print,
+                       *, tensorboard: bool = False) -> dict:
     config = config or TrainConfig()
     config.validate()
     require_reference()
+    writer_type = load_summary_writer() if tensorboard else None
     source, destination = Path(weights_path).expanduser().resolve(), Path(out_dir).expanduser().resolve()
     weights_hash = file_sha256(source)
     log("Validating training cache, source hashes and floating-point targets")
@@ -333,11 +344,18 @@ def train_distillation(weights_path, pruning_report, train_cache, val_cache, out
                    "cuda_rng_state": torch.cuda.get_rng_state_all() if device.type == "cuda" else []}
         _atomic_write(path, lambda temporary: torch.save(payload, temporary))
 
+    writer = None
+
     def validate_student():
         inference.load_state_dict(student.export_state(), strict=True)
-        return evaluate_network(inference, validation, device, log)
+        return evaluate_network(inference, validation, device, log,
+                                on_image=image_callback(writer, "val", report["global_step"]))
 
     try:
+        if writer_type is not None:
+            writer = writer_type(log_dir=str(destination / "tensorboard"), flush_secs=30,
+                                 purge_step=report["global_step"] + 1 if restored is not None else None)
+            log(f"TensorBoard: {destination / 'tensorboard'} (optimizer steps; images: input | teacher | student)")
         persist()
         if restored is None:
             log("Evaluating pruning-only baseline through the ordinary inference graph")
@@ -346,6 +364,9 @@ def train_distillation(weights_path, pruning_report, train_cache, val_cache, out
             save_checkpoint(destination / "best.pt")
             save_checkpoint(destination / "last.pt")
             _export(student, metadata, destination / "best.safetensors")
+            write_metrics(writer, "val", report["baseline"], 0)
+            if writer is not None:
+                writer.flush()
         # No optimizer update: verify full-frame backward and memory before the real run.
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
@@ -372,6 +393,7 @@ def train_distillation(weights_path, pruning_report, train_cache, val_cache, out
             optimizer.zero_grad(set_to_none=True)
             order = torch.randperm(len(train), generator=torch.Generator().manual_seed(config.seed + epoch)).tolist()
             loss_sum, learning_rate = 0.0, optimizer.param_groups[0]["lr"]
+            group_loss = 0.0
             epoch_started = time.perf_counter()
             for position, index in enumerate(order):
                 item = train[index]
@@ -381,14 +403,20 @@ def train_distillation(weights_path, pruning_report, train_cache, val_cache, out
                 if not math.isfinite(loss_value):
                     raise ValueError("training loss is nonfinite")
                 loss_sum += loss_value
+                group_loss += loss_value
                 group_start = position - position % config.accumulation
                 group_size = min(config.accumulation, len(train) - group_start)
                 (loss / group_size).backward()
                 if (position + 1) % config.accumulation == 0 or position + 1 == len(order):
-                    torch.nn.utils.clip_grad_norm_(student.parameters(), config.grad_clip, error_if_nonfinite=True)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        student.parameters(), config.grad_clip, error_if_nonfinite=True)
                     optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
                     report["global_step"] += 1
+                    write_scalar(writer, "train/loss_step", group_loss / group_size, report["global_step"])
+                    write_scalar(writer, "train/learning_rate", learning_rate, report["global_step"])
+                    write_scalar(writer, "train/grad_norm", grad_norm, report["global_step"])
+                    group_loss = 0.0
                 log(f"Epoch {epoch + 1}/{config.epochs} image {position + 1}/{len(order)} "
                     f"{item['name']}: loss={loss_value:.8g}, step={report['global_step']}, lr={learning_rate:.4g}")
                 del prediction, loss, item
@@ -409,12 +437,24 @@ def train_distillation(weights_path, pruning_report, train_cache, val_cache, out
                 save_checkpoint(destination / "best.pt")
                 _export(student, metadata, destination / "best.safetensors")
             save_checkpoint(destination / "last.pt")
+            step = report["global_step"]
+            write_scalar(writer, "train/loss_epoch", loss_sum / len(train), step)
+            write_scalar(writer, "train/epoch", completed, step)
+            write_metrics(writer, "val", metrics, step)
+            write_scalar(writer, "best/mse", report["best"]["mse"], step)
+            write_scalar(writer, "best/epoch", report["best_epoch"], step)
+            write_scalar(writer, "val/bad_epochs", bad_epochs, step)
+            if writer is not None:
+                writer.flush()
             log(f"Epoch {completed}: validation PSNR={metrics['psnr_db']:.4f}dB, "
                 f"best={report['best']['psnr_db']:.4f}dB, no-improvement epochs={bad_epochs}")
         # Validate the actual deployable artifact, not the training surrogate path.
         log("Reloading best.safetensors into the ordinary inference model")
         report["export_validation"] = evaluate_export(
-            source, destination / "best.safetensors", val_cache, device=device, log=log)["metrics"]
+            source, destination / "best.safetensors", val_cache, device=device, log=log,
+            on_image=image_callback(writer, "final", report["global_step"]))["metrics"]
+        write_metrics(writer, "final", report["export_validation"], report["global_step"])
+        write_scalar(writer, "final/best_epoch", report["best_epoch"], report["global_step"])
         report["improved"] = report["export_validation"]["mse"] < report["baseline"]["mse"]
         report["status"] = "completed"
         report["stop_reason"] = "early_stopping" if bad_epochs >= config.patience else "epochs_completed"
@@ -428,3 +468,12 @@ def train_distillation(weights_path, pruning_report, train_cache, val_cache, out
             report["error"] += "; no automatic resolution change was made"
         persist()
         raise
+    finally:
+        if writer is not None:
+            active_error = sys.exception()
+            try:
+                writer.close()
+            except Exception as close_error:
+                if active_error is None:
+                    raise
+                active_error.add_note(f"TensorBoard close also failed: {close_error}")

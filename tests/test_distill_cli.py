@@ -30,8 +30,9 @@ def test_prepare_dispatches_paths_device_and_progress(monkeypatch, capsys):
 def test_train_dispatches_default_and_custom_configuration(monkeypatch, custom, capsys):
     calls = []
 
-    def train(*arguments):
+    def train(*arguments, **options):
         calls.append(arguments)
+        assert options == {"tensorboard": custom}
         return {"status": "completed", "best_epoch": 2, "export_validation": {"psnr_db": 42.0},
                 "improved": True}
 
@@ -42,7 +43,7 @@ def test_train_dispatches_default_and_custom_configuration(monkeypatch, custom, 
         arguments += ["--weights", "teacher.safetensors", "--device", "cpu", "--out", "run",
                       "--epochs", "3", "--lr", "0.02", "--min-lr", "0.001", "--accumulation", "2",
                       "--grad-clip", "0.7", "--patience", "2", "--seed", "4", "--no-checkpoint",
-                      "--resume", "run/last.pt"]
+                      "--resume", "run/last.pt", "--tensorboard"]
     assert distill.main(arguments) == 0
     actual = calls[0]
     config = actual[6]

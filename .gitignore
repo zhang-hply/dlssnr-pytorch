@@ -11,3 +11,4 @@ __pycache__/
 nvngx*
 streamline*
 out/
+events.out.tfevents.*

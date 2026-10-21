@@ -46,6 +46,8 @@ def main(argv=None) -> int:
     train.add_argument("--patience", type=int, default=5)
     train.add_argument("--seed", type=int, default=0, help="training shuffle seed; Controls.seed stays zero")
     train.add_argument("--no-checkpoint", action="store_true", help="disable block activation checkpointing")
+    train.add_argument("--tensorboard", action="store_true",
+                       help="record curves and full-resolution validation comparisons in <out>/tensorboard")
     evaluate = commands.add_parser("evaluate", help="evaluate best.safetensors via the ordinary inference graph")
     evaluate.add_argument("--checkpoint", required=True, help="exported safetensors plus its sibling JSON metadata")
     evaluate.add_argument("--cache", required=True)
@@ -62,7 +64,8 @@ def main(argv=None) -> int:
             config = TrainConfig(args.epochs, args.lr, args.min_lr, args.accumulation,
                                  args.grad_clip, args.patience, args.seed, not args.no_checkpoint)
             report = train_distillation(args.weights, args.pruning_report, args.train_cache,
-                                        args.val_cache, args.out, args.device, config, args.resume, log)
+                                        args.val_cache, args.out, args.device, config, args.resume, log,
+                                        tensorboard=args.tensorboard)
             log(f"Training {report['status']}: best epoch={report['best_epoch']}, "
                 f"export PSNR={report['export_validation']['psnr_db']:.4f}dB, "
                 f"improved={report['improved']}; reports: {args.out}")

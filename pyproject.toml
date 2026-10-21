@@ -17,6 +17,7 @@ dependencies = ["numpy", "pillow", "safetensors"]
 rocm = ["torch"]
 cuda = ["torch"]
 cpu = ["torch"]
+tensorboard = ["tensorboard"]
 
 [tool.uv]
 conflicts = [[{ extra = "rocm" }, { extra = "cuda" }, { extra = "cpu" }]]

@@ -251,6 +251,45 @@ The baseline remains the best artifact if training never improves validation err
 throughout preparation, training and evaluation. Interrupting preparation preserves completed targets;
 interrupting training preserves the last completed epoch.
 
+### TensorBoard
+
+Install the optional extra alongside your hardware extra, for example
+`uv sync --extra cuda --extra tensorboard`. For an existing environment,
+`uv pip install tensorboard` installs just the logging dependency.
+
+```bash
+python scripts/distill.py train --pruning-report out/ablation.json \
+  --train-cache out/teacher_train --val-cache out/teacher_val \
+  --out out/distilled --device cuda --tensorboard
+
+tensorboard --logdir out/distilled/tensorboard
+```
+
+Open the address printed by TensorBoard (usually `http://localhost:6006`). Logging is opt-in;
+without `--tensorboard`, the dependency is not imported and no event directory is created.
+
+All curves and images use **optimizer updates** as their step axis. `train/loss_step` is the mean
+unscaled loss of the actual accumulation group, including a shorter final group. Each update also
+records `train/learning_rate` and the **pre-clipping** `train/grad_norm`. Completed epochs record
+`train/loss_epoch`, `train/epoch`, `val/loss`, float and uint8 MSE/PSNR, available SSIM, best MSE/epoch,
+and `val/bad_epochs`. Validation loss uses the same L1-plus-edge loss on the ordinary inference graph.
+The pruning-only baseline is step 0; preflight does not count as training. Infinite PSNR is recorded
+as text rather than a finite scalar; unavailable SSIM is omitted.
+
+The Images tab shows the first three validation frames (or all frames if fewer), in fixed manifest
+order. Each comparison is **input | teacher | student**, left to right, with each panel at its original
+resolution and the filename in the corresponding Text entry. Comparisons are recorded for the
+baseline and each epoch under `val/images`, then for the reloaded best export under `final/images`.
+Final metrics use `final/*` tags. These full-resolution PNG events can make logs large; image logging
+reuses the validation forward passes and does not resize training or evaluation inputs.
+
+Pass `--tensorboard` again when resuming with `--resume out/distilled/last.pt`. The same log directory
+is reused, and events beyond the restored checkpoint's optimizer step are hidden so abandoned
+partial epochs do not appear twice. Logging can also be enabled when resuming an older checkpoint;
+only subsequent work is recorded, without reconstructing historical curves or images. Events flush
+every 30 seconds, at completed epochs, and on normal or interrupted shutdown. The existing JSON and
+Markdown reports remain available independently of TensorBoard.
+
 ## The network
 
 71 blocks, 152 layers, 141 MB of FP8 weights, in a U-Net shape. A frame is padded to a multiple of what its
