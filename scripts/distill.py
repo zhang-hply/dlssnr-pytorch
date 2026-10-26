@@ -35,6 +35,8 @@ def main(argv=None) -> int:
     prepare.add_argument("--out", required=True)
     train = commands.add_parser("train", help="recover the best pruning-report mask with all retained weights")
     train.add_argument("--pruning-report", required=True)
+    train.add_argument("--plan-method", choices=("best", "depth", "width", "hybrid"), default="best",
+                       help="select the overall best or a method's best result from a comparison report")
     train.add_argument("--train-cache", required=True)
     train.add_argument("--val-cache", required=True)
     train.add_argument("--out", default="out/distilled")
@@ -70,7 +72,7 @@ def main(argv=None) -> int:
                                  args.grad_clip, args.patience, args.seed, not args.no_checkpoint)
             report = train_distillation(args.weights, args.pruning_report, args.train_cache,
                                         args.val_cache, args.out, args.device, config, args.resume, log,
-                                        tensorboard=args.tensorboard)
+                                        tensorboard=args.tensorboard, plan_method=args.plan_method)
             log(f"Training {report['status']}: best epoch={report['best_epoch']}, "
                 f"export PSNR={report['export_validation']['psnr_db']:.4f}dB, "
                 f"improved={report['improved']}; reports: {args.out}")

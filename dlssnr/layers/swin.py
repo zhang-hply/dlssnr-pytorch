@@ -124,6 +124,9 @@ class SwinParams(nn.Module):
     def __init__(self, channels: int, heads: int, **buffers: torch.Tensor | None):
         super().__init__()
         self.channels, self.heads = channels, heads
+        # The original head count also controls MLP grouping and rounding.
+        # Structural attention pruning changes only this independent count.
+        self.attention_heads = heads
         for name, value in buffers.items():
             self.register_buffer(name, value)
 
@@ -322,7 +325,7 @@ def _attention(params: SwinParams, skip: torch.Tensor, quantised: torch.Tensor, 
     Q and K are scaled straight from the float32 accumulator (Q also by the head's scale); V, the
     probabilities and the context are narrowed to f16 before they reach the e4m3 grid.
     """
-    heads, count = params.heads, quantised.shape[0]
+    heads, count = params.attention_heads, quantised.shape[0]
     kernels = None if "swin" in int8.sites else triton_kernels(quantised)
     if kernels:
         qkv = _linear(quantised, params.qkv).reshape(count * TOKENS, -1)
@@ -362,7 +365,7 @@ def swin_block(params: SwinParams, x: torch.Tensor, shift_x: int, shift_y: int,
         return (fused[0].float(), fused[1]) if accumulator else fused.float()
     quantised, grid = _to_windows(round8(x), shift_y, shift_x)
     residual = quantised if x_wide is None else _to_windows(x_wide, shift_y, shift_x)[0]
-    per_window = max(1, _CHUNK_ELEMENTS // (params.heads * TOKENS * TOKENS))
+    per_window = max(1, _CHUNK_ELEMENTS // (params.attention_heads * TOKENS * TOKENS))
     out = torch.empty_like(quantised)
     inside = None
     if params.i4 is not None and params.i4.qkv is not None:

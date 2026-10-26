@@ -1,4 +1,4 @@
-"""A trainable, quantization-aware version of a fixed whole-block pruning mask.
+"""Quantization-aware recovery of a fixed depth/width pruning structure.
 
 The inference modules keep decoded weights as buffers. A student owns a fresh
 network, promotes only the retained learned buffers to float32 master parameters,
@@ -25,7 +25,9 @@ from .io import Controls
 from .layers import decoder, pre_post, split_swin, swin, vit
 from .model import NRNet, _main
 from .plan import LayerSpec, build_plan
+from .pruning import PruningSpec, validate_spec
 from .training import distillation_mode, fp8_ste, fp16_ste
+from .width_pruning import apply_spec, validate_applied_spec
 
 
 def validate_pruning(plan: Sequence[LayerSpec], dropped_blocks: Iterable[int],
@@ -56,19 +58,21 @@ def validate_pruning(plan: Sequence[LayerSpec], dropped_blocks: Iterable[int],
 
 
 def read_pruning_report(path: str | Path, plan: Sequence[LayerSpec],
-                        keep_ratio: float = 0.8) -> dict:
-    """Read ``ablate.py`` JSON and revalidate its best mask at the current size.
+                        keep_ratio: float = 0.8, *, plan_method: str = "best",
+                        weights_hash: str | None = None, controls: dict | None = None) -> dict:
+    """Read an ablation report and revalidate the selected structure and MACs.
 
     MAC counts and layer indices from the report are never trusted. When present,
     its original image dimensions must describe exactly the supplied plan.
     """
     with Path(path).open(encoding="utf-8") as handle:
         report = json.load(handle)
-    if not isinstance(report, dict) or not isinstance(report.get("best"), dict):
-        raise ValueError("pruning report has no best combination")
-    blocks = report["best"].get("blocks")
-    if not isinstance(blocks, list):
-        raise ValueError("pruning report best.blocks must be a list")
+    if plan_method not in {"best", "depth", "width", "hybrid"}:
+        raise ValueError("plan_method must be best, depth, width or hybrid")
+    if not isinstance(report, dict) or type(report.get("schema_version", 1)) is not int \
+            or report.get("schema_version", 1) not in (1, 2):
+        raise ValueError("unsupported pruning report schema")
+    version = report.get("schema_version", 1)
     metadata = report.get("metadata", {})
     if not isinstance(metadata, dict):
         raise ValueError("pruning report metadata must be an object")
@@ -79,7 +83,40 @@ def read_pruning_report(path: str | Path, plan: Sequence[LayerSpec],
             raise ValueError("pruning report dimensions must be integer width and height")
         if list(plan) != build_plan(width, height):
             raise ValueError("pruning report dimensions do not match the student's model plan")
-    return validate_pruning(plan, blocks, keep_ratio)
+    if weights_hash is not None and metadata.get("weights_sha256") not in (None, weights_hash):
+        raise ValueError("pruning report was searched with different source weights")
+    if controls is not None and metadata.get("controls") not in (None, controls):
+        raise ValueError("pruning report controls differ from the teacher cache and training controls")
+    if version == 1:
+        if plan_method not in {"best", "depth"}:
+            raise ValueError(f"legacy pruning report has no {plan_method} method")
+        row = report.get("best")
+        if not isinstance(row, dict):
+            raise ValueError("pruning report has no best combination")
+        if "pruning_spec" in row:
+            raise ValueError("structured pruning requires a schema-v2 report")
+        blocks = row.get("blocks")
+        if not isinstance(blocks, list):
+            raise ValueError("pruning report best.blocks must be a list")
+        return validate_pruning(plan, blocks, keep_ratio)
+    if plan_method == "best":
+        row = report.get("best")
+    else:
+        methods = report.get("methods", {})
+        method = methods.get(plan_method) if isinstance(methods, dict) else None
+        row = method.get("best") if isinstance(method, dict) else None
+    if not isinstance(row, dict):
+        raise ValueError(f"pruning report has no feasible {plan_method} combination")
+    if "pruning_spec" not in row:
+        raise ValueError("schema-v2 pruning result is missing pruning_spec")
+    selected = PruningSpec.from_dict(row["pruning_spec"])
+    if plan_method == "depth" and selected.widths:
+        raise ValueError("depth result must not include width pruning")
+    if plan_method == "width" and selected.dropped_blocks:
+        raise ValueError("width result must not include dropped blocks")
+    result = validate_spec(plan, selected, keep_ratio)
+    result["plan_method"] = plan_method
+    return result
 
 
 class _InferenceFormat(nn.Module):
@@ -143,17 +180,24 @@ class DistilledStudent(nn.Module):
     branches; recomputation enters the same training context as the first pass.
     """
 
-    def __init__(self, net: NRNet, dropped_blocks: Iterable[int],
+    def __init__(self, net: NRNet, dropped_blocks: Iterable[int] = (),
                  checkpoint_blocks: bool = True, controls: Controls | None = None,
-                 keep_ratio: float = 0.8):
+                 keep_ratio: float = 0.8, *, pruning_spec: PruningSpec | None = None):
         super().__init__()
         require_reference(net)
-        self.pruning = validate_pruning(net.plan, dropped_blocks, keep_ratio)
+        dropped_blocks = tuple(dropped_blocks)
+        if pruning_spec is not None and dropped_blocks:
+            raise ValueError("supply either dropped_blocks or pruning_spec, not both")
+        self.pruning_spec = pruning_spec
+        self.pruning = (validate_pruning(net.plan, dropped_blocks, keep_ratio) if pruning_spec is None else
+                        validate_spec(net.plan, pruning_spec, keep_ratio))
         expected_skip = set(self.pruning["layer_indices"])
         if net.skip and net.skip != expected_skip:
             raise ValueError("student network has an existing incompatible or partial skip mask")
         if list(net.parameters()):
             raise ValueError("student must own a fresh inference network with buffer weights")
+        if pruning_spec is not None:
+            apply_spec(net, pruning_spec)
         self.net = net
         self.controls = copy.deepcopy(controls if controls is not None else Controls())
         self.checkpoint_blocks = bool(checkpoint_blocks)
@@ -218,6 +262,8 @@ class DistilledStudent(nn.Module):
             raise ValueError(f"expected padded float32 input {shape}, got {tuple(image.shape)} {image.dtype}")
         if self.net.skip != set(self.pruning["layer_indices"]):
             raise ValueError("the student's fixed whole-block pruning mask was modified")
+        if self.pruning_spec is not None:
+            validate_applied_spec(self.net, self.pruning_spec)
         outputs: dict[int, object] = {}
         int4.reset()
         with distillation_mode():

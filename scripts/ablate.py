@@ -1,7 +1,8 @@
-"""Search for block-pruned networks that approximate the full network within a MAC budget.
+"""Search depth/width-pruned networks that approximate the full model within a MAC budget.
 
     python scripts/ablate.py --input frames/ --keep-ratio 0.8 --out out/ablation.md
     python scripts/ablate.py --input frame.png --reference nvidia.png --max-evals 400
+    python scripts/ablate.py --input frames/ --method compare --out out/pruning_compare.md
 
 Directory inputs are read in filename order, non-recursively, and must have the same dimensions.
 References are optional and never affect ranking. One evaluation runs a combination on every input;
@@ -209,17 +210,31 @@ def image_mse(a: np.ndarray, b: np.ndarray) -> float:
 
 
 class ModelEvaluator:
-    def __init__(self, net, cases: list[ImageCase], controls: Controls, candidates, on_progress=None):
+    def __init__(self, net, cases: list[ImageCase], controls: Controls, candidates, on_progress=None,
+                 *, applier=None):
         self.net, self.cases, self.controls, self.candidates = net, cases, controls, candidates
         self.forward_calls = {"baseline": 0, "search": 0, "ssim": 0}
         self.on_progress = on_progress
+        self.applier = applier
+
+    def reset(self) -> None:
+        if self.applier is None:
+            self.net.skip = set()
+        else:
+            self.applier.reset()
+
+    def _select(self, selection) -> None:
+        if self.applier is None:
+            self.net.skip = {i for block in selection for i in self.candidates[block].indices}
+        else:
+            self.applier.apply(selection)
 
     def _log(self, message: str) -> None:
         if self.on_progress is not None:
             self.on_progress(message)
 
     def baseline(self, on_image=None) -> dict:
-        self.net.skip = set()
+        self.reset()
         reference_error, count = 0.0, 0
         for index, case in enumerate(self.cases, 1):
             self._log(f"Baseline image {index}/{len(self.cases)}: {case.path.name} starting")
@@ -240,10 +255,10 @@ class ModelEvaluator:
         return result
 
     def __call__(self, blocks: tuple[int, ...]) -> dict:
-        self.net.skip = {i for block in blocks for i in self.candidates[block].indices}
         squared_error, reference_error, count = 0.0, 0.0, 0
         per_image = []
         try:
+            self._select(blocks)
             for index, case in enumerate(self.cases, 1):
                 self._log(f"Search image {index}/{len(self.cases)}: {case.path.name} starting")
                 started = time.perf_counter()
@@ -262,7 +277,7 @@ class ModelEvaluator:
                           f"MSE={mse:.6f} PSNR={row['psnr_db']:.2f}dB "
                           f"done in {time.perf_counter() - started:.2f}s")
         finally:
-            self.net.skip = set()
+            self.reset()
         result = {"mse": squared_error / count, "per_image": per_image}
         if self.cases[0].reference is not None:
             result.update(reference_mse=reference_error / count,
@@ -277,9 +292,13 @@ class ModelEvaluator:
             if self.cases[0].reference is not None:
                 row["reference_ssim"] = None
             return
-        self.net.skip = set(row["layer_indices"])
         full_scores, reference_scores = [], []
         try:
+            if self.applier is None:
+                self.net.skip = set(row["layer_indices"])
+            else:
+                from dlssnr.pruning import PruningSpec
+                self._select(PruningSpec.from_dict(row["pruning_spec"]))
             for index, (case, image_row) in enumerate(zip(self.cases, row["per_image"]), 1):
                 self._log(f"SSIM image {index}/{len(self.cases)}: {case.path.name} starting")
                 started = time.perf_counter()
@@ -295,7 +314,7 @@ class ModelEvaluator:
                 self._log(f"SSIM image {index}/{len(self.cases)}: {case.path.name} "
                           f"SSIM={image_row['ssim']:.4f} done in {time.perf_counter() - started:.2f}s")
         finally:
-            self.net.skip = set()
+            self.reset()
         row["ssim"] = float(np.mean(full_scores))
         if reference_scores:
             row["reference_ssim"] = float(np.mean(reference_scores))
@@ -384,6 +403,175 @@ def write_report(path: Path, payload: dict) -> None:
     atomic_text(path, "\n".join(lines))
 
 
+def describe_pruning(raw: dict) -> str:
+    """Compact display; original retained indices remain in the JSON spec."""
+    descriptions = []
+    if raw["dropped_blocks"]:
+        descriptions.append(f"drop={raw['dropped_blocks']}")
+    for width in raw["widths"]:
+        axes = []
+        if "mlp" in width:
+            axes.append(f"MLP={len(width['mlp'])}x{len(width['mlp'][0])}")
+        if "heads" in width:
+            axes.append(f"heads={len(width['heads'])}")
+        descriptions.append(f"b{width['block']}({', '.join(axes)})")
+    return "; ".join(descriptions) or "full model"
+
+
+def write_structured_report(path: Path, payload: dict) -> None:
+    atomic_text(path.with_suffix(".json"), json.dumps(json_safe(payload), indent=2, allow_nan=False) + "\n")
+    metadata, progress = payload["metadata"], payload["progress"]
+    lines = ["# Depth and width pruning search", "",
+             f"Status: {payload['status']}; stop reason: {payload['stop_reason']}", "",
+             "Heuristic search: these are the best measured structures, not a guarantee of global optimality.",
+             "Scores compare final uint8 outputs against one shared full-network baseline.",
+             "Matrix MACs exclude elementwise work and memory transfers; savings are not measured latency.", "",
+             f"Input: {metadata['width']}x{metadata['height']}, {len(metadata['inputs'])} image(s)",
+             f"Weights: `{metadata['weights']}`; SHA256: `{metadata.get('weights_sha256', 'pending')}`",
+             f"Controls: `{json.dumps(metadata['controls'], sort_keys=True)}`",
+             f"Search configuration: `{json.dumps(metadata['search'], sort_keys=True)}`",
+             f"Full model: {metadata['total_macs'] / 1e9:.6f} GMAC; "
+             f"target remaining: <= {metadata['search']['keep_ratio'] * 100:.2f}%", "",
+             f"Shared unique evaluations: {progress['unique_evaluations']}; "
+             f"logical method requests: {progress['logical_evaluations']}; phase: {progress['phase']}",
+             f"Forward calls: baseline={progress['forward_calls']['baseline']}, "
+             f"search={progress['forward_calls']['search']}, SSIM replays={progress['forward_calls']['ssim']}",
+             "Each method has its own max_evals limit. Cross-method cache hits count toward that method's "
+             "logical budget but do not repeat inference.", "",
+             "Width candidates retain 75% or 50% of MLP hidden dimensions and whole attention heads; "
+             "residual stream widths stay fixed. Original retained indices are recorded in pruning_spec.", ""]
+    if payload.get("error"):
+        lines += [f"Error: {payload['error']}", ""]
+    lines += ["## Best measured structure", ""]
+    if payload["best"] is None:
+        lines += ["No feasible structure has been evaluated yet.", ""]
+    else:
+        best = payload["best"]
+        lines += [describe_pruning(best["pruning_spec"]), "",
+                  f"Remaining MACs: {best['keep_ratio'] * 100:.4f}%; "
+                  f"MSE={best['mse']:.6f}; PSNR={best['psnr_db']:.2f} dB", ""]
+    for name, result in payload["methods"].items():
+        stats = result["progress"]
+        lines += [f"## {name}", "",
+                  f"Stop reason: {result['stop_reason']}; phase: {stats['phase']}; "
+                  f"evaluated={stats['unique_evaluations']}/{stats['max_evals']}", "",
+                  "| Rank | Structure | GMAC | Remaining % | MSE | PSNR dB | SSIM |",
+                  "| ---: | --- | ---: | ---: | ---: | ---: | ---: |"]
+        for rank, row in enumerate(result["top_results"], 1):
+            structure = "N/A" if row.get("ssim") is None else f"{row['ssim']:.4f}"
+            lines.append(f"| {rank} | {describe_pruning(row['pruning_spec'])} | "
+                         f"{row['macs'] / 1e9:.6f} | {row['keep_ratio'] * 100:.4f} | "
+                         f"{row['mse']:.6f} | {row['psnr_db']:.2f} | {structure} |")
+        if not result["top_results"]:
+            lines += ["", "No feasible structure has been evaluated for this method yet."]
+        lines += [""]
+    lines += [f"All unique measurements, per-image scores and replayable specifications: "
+              f"`{path.with_suffix('.json').name}`.",
+              "SSIM is replayed once per distinct final Top-K structure across methods. "
+              "N/A means pending or unavailable (image dimensions must exceed five pixels).", ""]
+    atomic_text(path, "\n".join(lines))
+
+
+def run_structured_search(args, cases, plan, config, output, device, suite) -> int:
+    from dlssnr.distill_data import file_sha256
+    from dlssnr.distillation import require_reference
+    from dlssnr.width_pruning import PruningApplier, rank_widths
+
+    height, width = cases[0].frame.shape[:2]
+    controls = Controls()
+    metadata = {
+        "inputs": [{"input": str(case.path), "reference": str(case.reference_path)
+                    if case.reference_path is not None else None} for case in cases],
+        "width": width, "height": height, "weights": str(Path(args.weights).expanduser().resolve()),
+        "device": str(device), "torch_version": torch.__version__, "controls": asdict(controls),
+        "backend_flags": {key: os.environ.get(key, "1") for key in ("DLSSNR_TRITON", "DLSSNR_COMPILE")},
+        "method": args.method, "search": asdict(config), "top_k": args.top_k,
+        "total_macs": suite.total_macs, "baseline": None,
+        "width_grid": [1.0, 0.75, 0.5],
+        "width_ranking": "fixed teacher L2 incoming/outgoing products; heads use V/output weights; "
+                         "ties by original index",
+    }
+    started = time.perf_counter()
+    status, error_message, exit_code = "running", None, 0
+    net, evaluator = None, None
+
+    def checkpoint(*_):
+        top = suite.best_results(args.top_k)
+        phase = suite.phase
+        if phase == "search" and suite.active_method is not None:
+            phase = f"{suite.active_method}/{suite.methods[suite.active_method].phase}"
+        payload = {
+            "schema_version": 2, "status": status, "stop_reason": suite.stop_reason,
+            "metadata": metadata, "error": error_message,
+            "progress": {"unique_evaluations": len(suite.cache.results),
+                         "logical_evaluations": sum(len(search.results) for search in suite.methods.values()),
+                         "phase": phase, "elapsed_seconds": time.perf_counter() - started,
+                         "forward_calls": dict(evaluator.forward_calls) if evaluator is not None
+                         else {"baseline": 0, "search": 0, "ssim": 0}},
+            "best": top[0] if top else None, "top_results": top,
+            "methods": suite.snapshot(args.top_k), "evaluations": list(suite.cache.results.values()),
+        }
+        write_structured_report(output, payload)
+
+    def on_result(search, row):
+        log(f"{search.method} [{len(search.results)}/{config.max_evals}] {search.phase}: "
+            f"keep={row['keep_ratio']:.4%} MSE={row['mse']:.6f} "
+            f"PSNR={row['psnr_db']:.2f}dB feasible={'yes' if row['feasible'] else 'no'} "
+            f"shared_evaluations={len(suite.cache.results)}; {describe_pruning(row['pruning_spec'])}")
+        checkpoint()
+
+    try:
+        suite.phase, suite.stop_reason = "baseline", "running"
+        checkpoint()
+        require_reference()
+        metadata["weights_sha256"] = file_sha256(metadata["weights"])
+        log(f"Loading reference network on {device}: {metadata['weights']}")
+        net = NRNet(Weights.load(metadata["weights"]), width, height).to(device)
+        require_reference(net)
+        log("Ranking original teacher MLP channels and attention heads")
+        suite.set_rankings(rank_widths(net))
+        evaluator = ModelEvaluator(net, cases, controls, units(plan), on_progress=log,
+                                   applier=PruningApplier(net))
+        log(f"{width}x{height}, {len(cases)} image(s); full={suite.total_macs / 1e9:.3f} GMAC; "
+            f"target <= {config.keep_ratio:.2%}; budget={config.max_evals} per method")
+        metadata["baseline"] = evaluator.baseline(checkpoint)
+        checkpoint()
+        suite.run(evaluator, on_result, log)
+        suite.phase = "ssim"
+        replay = suite.ssim_results(args.top_k)
+        log(f"Scoring SSIM for {len(replay)} distinct final structures across methods")
+        for index, row in enumerate(replay, 1):
+            log(f"SSIM structure {index}/{len(replay)}: {describe_pruning(row['pruning_spec'])}")
+            evaluator.supplement_ssim(row)
+            checkpoint()
+        suite.phase, status = "done", "completed"
+    except KeyboardInterrupt:
+        status, suite.stop_reason, exit_code = "interrupted", "interrupted", 130
+        log("Interrupted; saving completed pruning evaluations.", file=sys.stderr)
+    except Exception as error:
+        status, suite.stop_reason, exit_code = "error", "error", 1
+        error_message = f"{type(error).__name__}: {error}"
+        log(error_message, file=sys.stderr)
+    finally:
+        try:
+            if evaluator is not None:
+                evaluator.reset()
+            elif net is not None:
+                net.skip = set()
+        except Exception as error:
+            log(f"could not restore full model: {error}", file=sys.stderr)
+            exit_code = exit_code or 1
+        try:
+            checkpoint()
+        except OSError as error:
+            log(f"could not save report: {error}", file=sys.stderr)
+            exit_code = exit_code or 1
+    log(f"Finished: status={status}, reason={suite.stop_reason}, "
+        f"unique_evaluations={len(suite.cache.results)}, elapsed={time.perf_counter() - started:.2f}s")
+    log(f"Reports: {output} and {output.with_suffix('.json')}")
+    return exit_code
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--input", required=True, help="one image or a directory of same-size images")
@@ -392,10 +580,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--device", default="auto")
     parser.add_argument("--out", default="out/ablation.md", help="Markdown report; sibling .json stores all results")
     parser.add_argument("--keep-ratio", type=float, default=0.8)
+    parser.add_argument("--method", choices=("depth", "width", "hybrid", "compare"), default="depth",
+                        help="depth preserves legacy whole-block search; compare runs depth, width and hybrid")
     parser.add_argument("--beam-width", type=int, default=2)
     parser.add_argument("--expand-top-k", type=int, default=6)
     parser.add_argument("--max-evals", type=int, default=400,
-                        help="maximum unique combinations; excludes baseline and SSIM replays")
+                        help="maximum unique combinations per method; excludes baseline and SSIM replays")
     parser.add_argument("--top-k", type=int, default=10)
     args = parser.parse_args(argv)
     try:
@@ -407,7 +597,12 @@ def main(argv: list[str] | None = None) -> int:
         plan = build_plan(width, height)
         candidates = units(plan)
         config = SearchConfig(args.keep_ratio, args.beam_width, args.expand_top_k, args.max_evals)
-        search = BlockSearch(candidates, sum(layer_macs(plan).values()), config)
+        suite = None
+        if args.method == "depth":
+            search = BlockSearch(candidates, sum(layer_macs(plan).values()), config)
+        else:
+            from dlssnr.pruning_search import SearchSuite
+            suite = SearchSuite(plan, config, args.method, BlockSearch)
         output = Path(args.out).expanduser().resolve()
         if output.suffix.lower() == ".json":
             raise ValueError("--out must name a Markdown report, not a .json file")
@@ -426,6 +621,9 @@ def main(argv: list[str] | None = None) -> int:
         device = resolve_device(args.device)
     except (ValueError, OSError, RuntimeError) as error:
         parser.error(str(error))
+
+    if suite is not None:
+        return run_structured_search(args, cases, plan, config, output, device, suite)
 
     controls = Controls()
     metadata = {

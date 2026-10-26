@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from scripts import distill
+from scripts import compare_ablation
 
 
 def test_prepare_dispatches_paths_device_and_progress(monkeypatch, capsys):
@@ -32,7 +33,7 @@ def test_train_dispatches_default_and_custom_configuration(monkeypatch, custom, 
 
     def train(*arguments, **options):
         calls.append(arguments)
-        assert options == {"tensorboard": custom}
+        assert options == {"tensorboard": custom, "plan_method": "width" if custom else "best"}
         return {"status": "completed", "best_epoch": 2, "export_validation": {"psnr_db": 42.0},
                 "improved": True}
 
@@ -43,7 +44,7 @@ def test_train_dispatches_default_and_custom_configuration(monkeypatch, custom, 
         arguments += ["--weights", "teacher.safetensors", "--device", "cpu", "--out", "run",
                       "--epochs", "3", "--lr", "0.02", "--min-lr", "0.001", "--accumulation", "2",
                       "--grad-clip", "0.7", "--patience", "2", "--seed", "4", "--no-checkpoint",
-                      "--resume", "run/last.pt", "--tensorboard"]
+                      "--resume", "run/last.pt", "--tensorboard", "--plan-method", "width"]
     assert distill.main(arguments) == 0
     actual = calls[0]
     config = actual[6]
@@ -115,3 +116,15 @@ def test_help_lists_subcommands(capsys):
     assert caught.value.code == 0
     output = capsys.readouterr().out
     assert all(command in output for command in ("prepare", "train", "evaluate"))
+
+
+def test_comparison_cli_selects_requested_pruning_method(monkeypatch, capsys):
+    def compare(*args, **kwargs):
+        assert args[:5] == ("pruning.json", "frames", "images", "weights.safetensors", "cpu")
+        assert kwargs == {"plan_method": "hybrid"}
+        return {"images": [{}], "aggregate": {"psnr_db": 40.0}}
+
+    monkeypatch.setattr(compare_ablation, "compare_ablation", compare)
+    assert compare_ablation.main(["--report", "pruning.json", "--input", "frames", "--out", "images",
+                                   "--device", "cpu", "--plan-method", "hybrid"]) == 0
+    assert "Saved 1 image pairs" in capsys.readouterr().out

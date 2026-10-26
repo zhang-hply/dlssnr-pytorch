@@ -293,6 +293,8 @@ class SplitQKVAttn(nn.Module):
     EXP_LOW, EXP_HIGH = 1.03125, 1.5693359375
     SUM_FLOOR = 6.103515625e-05
     NORM_FLOOR = 0.000062
+    # Instance overrides narrow attention without changing the 512-wide stream.
+    heads = HEADS
 
     def __init__(self, spec: LayerSpec, weights: Weights):
         super().__init__()
@@ -379,15 +381,16 @@ class SplitQKVAttn(nn.Module):
     @inference_forward
     def forward(self, x: torch.Tensor, skip: torch.Tensor | None = None) -> torch.Tensor:
         _, channels, height, width = x.shape
+        heads, context_channels = self.heads, self.heads * HEAD_DIM
         tokens, (rows, cols, top, left) = self.windows(x)
         count = tokens.shape[0]
         if self.i4 is not None:
             # int4: the QKV of the projection's f16 value; tiles outside the map have zero Q, K and V
             inside = self.windows(torch.ones_like(x[:, :1]))[0]
             value = self.windows(int4.side[("attn", self.block)])[0]
-            qkv = (self.i4(value.reshape(-1, channels)) * inside.reshape(-1, 1)).reshape(count, 64, HEADS, 3, HEAD_DIM)
+            qkv = (self.i4(value.reshape(-1, channels)) * inside.reshape(-1, 1)).reshape(count, 64, heads, 3, HEAD_DIM)
         else:
-            qkv = int8.mm(tokens, self.qkv, "split").reshape(count, 64, HEADS, 3, HEAD_DIM)
+            qkv = int8.mm(tokens, self.qkv, "split").reshape(count, 64, heads, 3, HEAD_DIM)
         if is_distilling():
             query = self.normalise(_half(qkv[..., 0, :]))
             key = self.normalise(_half(qkv[..., 1, :]))
@@ -401,7 +404,7 @@ class SplitQKVAttn(nn.Module):
 
         logits = torch.einsum("wihd,wjhd->whij", query, key) + self.bias
         exponent = self.exponential(logits)                                          # [windows, heads, query, key]
-        partial = exponent.reshape(count, HEADS, 64, 4, 2, 8)                        # key = 16 tile + 8 half + 1 c
+        partial = exponent.reshape(count, heads, 64, 4, 2, 8)                        # key = 16 tile + 8 half + 1 c
         columns = ((partial[..., 0, :, :] + partial[..., 1, :, :]) + partial[..., 2, :, :]) + partial[..., 3, :, :]
         pairs = columns[..., 0::2] + columns[..., 1::2]                              # (0+1, 2+3, 4+5, 6+7)
         halves = (pairs[..., 0] + pairs[..., 1]) + (pairs[..., 2] + pairs[..., 3])
@@ -409,8 +412,8 @@ class SplitQKVAttn(nn.Module):
         inverse = 1.0 / total.clamp_min(self.SUM_FLOOR)
         probability = q8(_half(exponent * inverse.unsqueeze(-1)))
         context = _store(torch.einsum("whij,wjhd->wihd", probability, value))
-        context = context.reshape(rows, cols, 2, 2, TILE, TILE, channels)
-        out = context.permute(6, 0, 2, 4, 1, 3, 5).reshape(channels, rows * WINDOW, cols * WINDOW)
+        context = context.reshape(rows, cols, 2, 2, TILE, TILE, context_channels)
+        out = context.permute(6, 0, 2, 4, 1, 3, 5).reshape(context_channels, rows * WINDOW, cols * WINDOW)
         return out[None, :, top:top + height, left:left + width].contiguous()
 
 

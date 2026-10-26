@@ -22,8 +22,10 @@ from .io import Controls, frame_to_tensor, tensor_to_frame
 from .metrics import ssim
 from .model import NRNet
 from .plan import build_plan
+from .pruning import PruningSpec, validate_spec
 from .runtime import clear_caches, resolve_device
 from .weights import Weights
+from .width_pruning import apply_spec
 
 
 @dataclass(frozen=True)
@@ -166,12 +168,14 @@ def _export(student, metadata: dict, destination: Path) -> None:
     if any(not torch.isfinite(value).all().item() for value in state.values()):
         raise ValueError("cannot export nonfinite weights")
     _atomic_write(destination, lambda temporary: save_file(
-        state, str(temporary), metadata={"format": "dlssnr-distilled", "schema_version": "1"}))
+        state, str(temporary), metadata={"format": "dlssnr-distilled",
+                                        "schema_version": str(metadata["schema_version"])}))
     _write_json(destination.with_suffix(".json"), metadata)
 
 
 def _validate_metadata(metadata: dict, weights_hash: str) -> None:
-    if not isinstance(metadata, dict) or metadata.get("schema_version") != 1:
+    if not isinstance(metadata, dict) or type(metadata.get("schema_version")) is not int \
+            or metadata["schema_version"] not in (1, 2):
         raise ValueError("unsupported distilled model metadata")
     if metadata.get("weights_sha256") != weights_hash:
         raise ValueError("distilled model requires the original teacher weights used during training")
@@ -179,7 +183,23 @@ def _validate_metadata(metadata: dict, weights_hash: str) -> None:
         raise ValueError("distilled model controls do not match the fixed defaults")
     if any(type(metadata.get(key)) is not int or metadata[key] < 1 for key in ("width", "height")):
         raise ValueError("invalid distilled model dimensions")
-    validate_pruning(build_plan(metadata["width"], metadata["height"]), metadata.get("dropped_blocks", []))
+    plan = build_plan(metadata["width"], metadata["height"])
+    if metadata["schema_version"] == 2:
+        if "pruning_spec" not in metadata:
+            raise ValueError("structured model metadata is missing pruning_spec")
+        result = validate_spec(plan, PruningSpec.from_dict(metadata["pruning_spec"]), 0.8)
+        if metadata.get("dropped_blocks", []) != result["blocks"]:
+            raise ValueError("dropped_blocks summary differs from pruning_spec")
+    else:
+        if "pruning_spec" in metadata:
+            raise ValueError("structured model requires schema-v2 metadata")
+        validate_pruning(plan, metadata.get("dropped_blocks", []))
+
+
+def _metadata_spec(metadata: dict) -> PruningSpec:
+    if metadata["schema_version"] == 2:
+        return PruningSpec.from_dict(metadata["pruning_spec"])
+    return PruningSpec(tuple(metadata.get("dropped_blocks", [])))
 
 
 def load_export(weights_path, checkpoint_path, device="cpu"):
@@ -194,8 +214,11 @@ def load_export(weights_path, checkpoint_path, device="cpu"):
         metadata = json.load(handle)
     _validate_metadata(metadata, file_sha256(source))
     net = _new_network(source, metadata["width"], metadata["height"])
+    if metadata["schema_version"] == 2:
+        apply_spec(net, _metadata_spec(metadata))
     net.load_state_dict(load_file(str(checkpoint_path), device="cpu"), strict=True)
-    net.skip = set(validate_pruning(net.plan, metadata["dropped_blocks"])["layer_indices"])
+    if metadata["schema_version"] == 1:
+        net.skip = set(validate_pruning(net.plan, metadata["dropped_blocks"])["layer_indices"])
     return net.to(resolve_device(str(device))).eval(), metadata
 
 
@@ -278,6 +301,15 @@ def _write_training_report(destination: Path, report: dict) -> None:
              f"Dropped blocks: `{report['metadata']['dropped_blocks']}`", "",
              "All validation scores use the ordinary inference graph with materialized weights.",
              "Float PSNR uses [0, 1]; uint8 PSNR and SSIM use the original output rounding.", ""]
+    if "pruning_spec" in report["metadata"]:
+        widths = report["metadata"]["pruning_spec"]["widths"]
+        lines += [f"Selected pruning method: {report['metadata']['plan_method']}", "",
+                  "| Block | MLP hidden per group | Attention heads |", "| --- | ---: | ---: |"]
+        for width in widths:
+            hidden = len(width["mlp"][0]) if "mlp" in width else "unchanged"
+            heads = len(width["heads"]) if "heads" in width else "unchanged"
+            lines.append(f"| {width['block']} | {hidden} | {heads} |")
+        lines += [""]
     if report.get("error"):
         lines += [f"Error: {report['error']}", ""]
     baseline = report.get("baseline")
@@ -308,7 +340,7 @@ def _write_training_report(destination: Path, report: dict) -> None:
 
 def train_distillation(weights_path, pruning_report, train_cache, val_cache, out_dir,
                        device="auto", config: TrainConfig | None = None, resume=None, log=print,
-                       *, tensorboard: bool = False) -> dict:
+                       *, tensorboard: bool = False, plan_method: str = "best") -> dict:
     config = config or TrainConfig()
     config.validate()
     require_reference()
@@ -320,7 +352,9 @@ def train_distillation(weights_path, pruning_report, train_cache, val_cache, out
     log("Validating held-out cache, source hashes and floating-point targets")
     validation = CachedFrames(val_cache, weights_hash)
     _check_data(train, validation)
-    pruning = read_pruning_report(pruning_report, build_plan(train.width, train.height))
+    pruning = read_pruning_report(pruning_report, build_plan(train.width, train.height),
+                                  plan_method=plan_method, weights_hash=weights_hash, controls=asdict(Controls()))
+    structure = PruningSpec.from_dict(pruning["spec"]) if "spec" in pruning else None
     if destination == train.root or destination == validation.root or destination in (source, Path(pruning_report).resolve()):
         raise ValueError("training output must be separate from source weights, pruning report and caches")
     if destination.exists() and not destination.is_dir():
@@ -329,22 +363,27 @@ def train_distillation(weights_path, pruning_report, train_cache, val_cache, out
         raise ValueError("training output is not empty; use --resume or a new output directory")
     destination.mkdir(parents=True, exist_ok=True)
     device = resolve_device(str(device))
-    metadata = {"schema_version": 1, "weights_sha256": weights_hash, "weights_path": str(source),
+    metadata = {"schema_version": 2 if structure is not None else 1,
+                "weights_sha256": weights_hash, "weights_path": str(source),
                 "width": train.width, "height": train.height, "controls": asdict(Controls()),
                 "dropped_blocks": pruning["blocks"], "pruning": pruning,
                 "train_manifest_sha256": file_sha256(train.root / "manifest.json"),
                 "val_manifest_sha256": file_sha256(validation.root / "manifest.json"),
                 "train_cache": str(train.root), "val_cache": str(validation.root),
                 "config": asdict(config), "device": str(device), "torch_version": str(torch.__version__)}
+    if structure is not None:
+        metadata.update(pruning_spec=structure.to_dict(), plan_method=plan_method)
     restored = torch.load(str(resume), map_location="cpu", weights_only=True) if resume is not None else None
     if restored is not None:
-        if restored.get("schema_version") != 1:
+        if type(restored.get("schema_version")) is not int or restored["schema_version"] not in (1, 2):
             raise ValueError("unsupported training checkpoint")
         _validate_metadata(restored.get("metadata"), weights_hash)
         for field in ("width", "height", "controls", "dropped_blocks", "train_manifest_sha256",
                       "val_manifest_sha256", "config"):
             if restored["metadata"].get(field) != metadata[field]:
                 raise ValueError(f"resume checkpoint has different {field}")
+        if _metadata_spec(restored["metadata"]) != _metadata_spec(metadata):
+            raise ValueError("resume checkpoint has a different pruning_spec (retained channels or heads)")
         # last.pt refers to the best artifact in the same run directory.
         if Path(resume).expanduser().resolve().parent != destination:
             raise ValueError("resume in the checkpoint's original output directory to preserve best artifacts")
@@ -353,10 +392,17 @@ def train_distillation(weights_path, pruning_report, train_cache, val_cache, out
         torch.cuda.manual_seed_all(config.seed)
     log(f"Building student: {train.width}x{train.height}, "
         f"{pruning['keep_ratio'] * 100:.4f}% MACs; dropped blocks={pruning['blocks']}")
-    student = DistilledStudent(_new_network(source, train.width, train.height), pruning["blocks"],
-                               checkpoint_blocks=config.checkpoint_blocks).to(device)
+    student_options = {"checkpoint_blocks": config.checkpoint_blocks}
+    if structure is not None:
+        student_options["pruning_spec"] = structure
+    student = DistilledStudent(_new_network(source, train.width, train.height),
+                               pruning["blocks"] if structure is None else (), **student_options).to(device)
     inference = _new_network(source, train.width, train.height)
-    inference.skip = set(pruning["layer_indices"])
+    if structure is not None:
+        apply_spec(inference, structure)
+        log(f"Pruning method={plan_method}; width-pruned blocks={[width.block for width in structure.widths]}")
+    else:
+        inference.skip = set(pruning["layer_indices"])
     optimizer = torch.optim.AdamW(student.parameters(), lr=config.learning_rate, weight_decay=0.0)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=config.epochs, eta_min=config.min_learning_rate)
@@ -386,7 +432,7 @@ def train_distillation(weights_path, pruning_report, train_cache, val_cache, out
         _write_training_report(destination, report)
 
     def save_checkpoint(path):
-        payload = {"schema_version": 1, "metadata": metadata, "student_state": student.state_dict(),
+        payload = {"schema_version": metadata["schema_version"], "metadata": metadata, "student_state": student.state_dict(),
                    "optimizer_state": optimizer.state_dict(), "scheduler_state": scheduler.state_dict(),
                    "completed_epochs": completed, "bad_epochs": bad_epochs, "report": report,
                    "rng_state": torch.get_rng_state(),
@@ -405,6 +451,9 @@ def train_distillation(weights_path, pruning_report, train_cache, val_cache, out
             writer = writer_type(log_dir=str(destination / "tensorboard"), flush_secs=30,
                                  purge_step=report["global_step"] + 1 if restored is not None else None)
             log(f"TensorBoard: {destination / 'tensorboard'} (optimizer steps; images: input | teacher | student)")
+            if structure is not None:
+                writer.add_text("pruning/structure", json.dumps({"method": plan_method,
+                                 "pruning_spec": structure.to_dict()}, indent=2), report["global_step"])
         persist()
         if restored is None:
             log("Evaluating pruning-only baseline through the ordinary inference graph")

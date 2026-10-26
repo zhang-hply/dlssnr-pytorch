@@ -190,6 +190,63 @@ the image paths recorded in the report; use it to override paths from another ma
 also accepts `ablation.md` when its sibling JSON exists. Inputs must match the report's dimensions.
 Use a new or empty output directory; completed image pairs and their manifest survive interruption.
 
+### Depth, width, and hybrid pruning
+
+`--method depth` is the default whole-block search above. `width` physically narrows the internal MLP
+matrices and removes complete attention heads; `hybrid` combines block removal with width changes.
+`compare` searches all three methods with the same inputs, teacher weights and Controls:
+
+```bash
+python scripts/ablate.py --input frames/ --method compare --keep-ratio 0.8 \
+  --max-evals 400 --top-k 10 --out out/pruning_compare.md --device cuda
+```
+
+All methods preserve the U-Net's residual-channel widths and use the same 59 safe blocks. Width levels
+are 100%, 75%, and 50% of each original MLP group's hidden size; head counts use the distinct ceilings
+of those fractions, always retaining at least one complete 32-channel head. This gives Swin group
+hidden widths 128/96/64, Split group widths 256/192/128, and ViT widths 4096/3072/2048. Original single-head
+Swin blocks offer only MLP pruning. Sampling, pre/post, and the special pooling/final-head blocks stay
+protected. The ordinary FP8/FP16 arithmetic and per-head normalization remain in use.
+
+The original weights determine nested retained-index rankings: incoming times outgoing L2 norms for
+MLP channels, and V times output-projection norms for heads. Actual output MSE determines candidate
+selection. Each search first screens the shallowest change at every site, measures a feasible seed,
+then explores successive width levels and block combinations. A whole-block removal clears that
+block's width choices. Costs are recomputed from the resulting matrix shapes and token padding.
+
+`--max-evals` is a **separate logical budget per method**, including singleton screening and the seed.
+The current minimum is 60 for depth, 113 for width, and 172 for hybrid/compare. Thus comparison with
+400 allows at most 1,200 logical candidate requests; shared measurements avoid repeated inference of
+identical structures. Baseline passes and final SSIM replays are counted separately, and duplicate
+SSIM candidates are replayed once. A method whose smallest supported structure cannot reach the
+requested MAC ratio is rejected before model inference.
+
+The Markdown and schema-v2 JSON reports contain each method's best and Top-K results, a global best,
+and the exact retained indices in `pruning_spec`. Choose a method for image comparison or recovery:
+
+```bash
+python scripts/compare_ablation.py --report out/pruning_compare.json --plan-method width \
+  --input frames/ --out out/width_comparison --device cuda
+
+python scripts/distill.py train --pruning-report out/pruning_compare.json --plan-method width \
+  --train-cache out/teacher_train --val-cache out/teacher_val \
+  --out out/distilled_width --device cuda --tensorboard
+```
+
+`--plan-method` accepts `best` (default, the global best), `depth`, `width`, or `hybrid`. Missing methods
+are errors. Use a separate output directory for each recovery run. Compatible teacher caches can be
+reused across methods; source weights, Controls and dimensions must match. Structured checkpoints
+store the retained indices, reconstruct the smaller matrices before loading weights or optimizer
+state, and reject resume with different retained channels/heads. Older whole-block reports and
+schema-v1 checkpoints remain supported; an unmodified depth search still writes the old report format.
+
+Width-pruned exports use the same tensor names with their compact shapes and require the sibling
+JSON metadata. Load them with `load_export()` as shown below, rather than directly loading the compact
+state into a full-width NRNet. TensorBoard and evaluation PNGs use the selected reconstructed structure.
+GPU kernels with fixed unsupported widths fall back to the general path. Search also restores an
+immutable CPU weight snapshot between candidates, so reported evaluation time includes that work;
+MAC reduction alone is not a measured inference speedup.
+
 ## Distilling a pruned model
 
 `scripts/distill.py` restores a fixed pruning mask by training all retained learned weights against the

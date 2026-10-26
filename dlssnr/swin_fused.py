@@ -121,7 +121,15 @@ def _kernel(x_ptr, wide_ptr, accumulator_ptr, expand_ptr, contract_ptr, qkv_ptr,
 
 
 def supported(params, x: torch.Tensor) -> bool:
-    return params.channels == CHANNELS.value and params.heads == 1 and x.is_cuda
+    # This kernel has compile-time C=32 and hidden=128. Narrow matrices must
+    # use the generic kernels; otherwise fixed loads can read out of bounds.
+    return (params.channels == CHANNELS.value and params.heads == 1
+            and params.attention_heads == 1 and x.is_cuda
+            and params.mid is None
+            and tuple(params.expand.shape) == (HIDDEN.value, CHANNELS.value)
+            and tuple(params.contract.shape) == (CHANNELS.value, HIDDEN.value)
+            and tuple(params.qkv.shape) == (3 * CHANNELS.value, CHANNELS.value)
+            and tuple(params.out_proj.shape) == (CHANNELS.value, CHANNELS.value))
 
 
 def swin_block_fused(params, x: torch.Tensor, shift_rows: int, shift_columns: int, wide_residual: bool,

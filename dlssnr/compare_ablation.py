@@ -12,12 +12,15 @@ import time
 import numpy as np
 
 from .distillation import read_pruning_report, require_reference
+from .distill_data import file_sha256
 from .io import Controls, load_image, save_image
 from .metrics import ssim
 from .model import NRNet
 from .plan import build_plan
+from .pruning import PruningSpec
 from .runtime import clear_caches, resolve_device
 from .weights import Weights
+from .width_pruning import PruningApplier
 
 
 _IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
@@ -85,7 +88,8 @@ def _save_manifest(root: Path, manifest: dict) -> None:
 
 
 def compare_ablation(report_path, input_path=None, out_dir="out/ablation_comparison",
-                     weights_path="weights.safetensors", device="auto", log=print) -> dict:
+                     weights_path="weights.safetensors", device="auto", log=print,
+                     *, plan_method: str = "best") -> dict:
     """Save baseline, best-mask output and a left-baseline/right-pruned PNG per input.
 
     With no explicit input, replay the image paths recorded in the report. Input
@@ -108,7 +112,6 @@ def compare_ablation(report_path, input_path=None, out_dir="out/ablation_compari
             or ("height" in metadata and metadata["height"] != height)):
         # Different raw image sizes can share an identical padded execution plan.
         raise ValueError("comparison input dimensions differ from the ablation report")
-    pruning = read_pruning_report(report_path, build_plan(width, height), keep_ratio=1.0)
     settings = metadata.get("controls", {})
     if not isinstance(settings, dict):
         raise ValueError("report controls must be an object")
@@ -119,6 +122,10 @@ def compare_ablation(report_path, input_path=None, out_dir="out/ablation_compari
     source = Path(weights_path).expanduser().resolve()
     if not source.is_file():
         raise ValueError(f"weights file does not exist: {source}")
+    pruning = read_pruning_report(report_path, build_plan(width, height), keep_ratio=1.0,
+                                  plan_method=plan_method, weights_hash=file_sha256(source),
+                                  controls=asdict(controls))
+    pruning_spec = PruningSpec.from_dict(pruning["spec"]) if "spec" in pruning else None
     device = resolve_device(str(device))
     require_reference()
     root = Path(out_dir).expanduser().resolve()
@@ -134,7 +141,9 @@ def compare_ablation(report_path, input_path=None, out_dir="out/ablation_compari
         "total_macs": pruning["total_macs"], "macs": pruning["macs"], "keep_ratio": pruning["keep_ratio"],
         "side_by_side_order": ["baseline", "pruned"], "images": [],
     }
-    net = None
+    if pruning_spec is not None:
+        manifest.update(schema_version=2, pruning_spec=pruning_spec.to_dict(), plan_method=plan_method)
+    net, applier = None, None
     started = time.perf_counter()
     squared, elements, structures = 0.0, 0, []
     try:
@@ -142,12 +151,19 @@ def compare_ablation(report_path, input_path=None, out_dir="out/ablation_compari
         log(f"Loading model on {device}; dropped blocks={pruning['blocks']}; "
             f"remaining MACs={pruning['keep_ratio'] * 100:.4f}%")
         net = NRNet(Weights.load(str(source)), width, height).to(device).eval()
+        if pruning_spec is not None:
+            applier = PruningApplier(net)
         for index, (path, frame) in enumerate(zip(paths, frames), 1):
             log(f"[{index}/{len(paths)}] {path.name}: full-model baseline starting")
             net.skip = set()
+            if applier is not None:
+                applier.reset()
             baseline = net(frame, controls)
             log(f"[{index}/{len(paths)}] {path.name}: best-mask inference starting")
-            net.skip = set(pruning["layer_indices"])
+            if applier is not None:
+                applier.apply(pruning_spec)
+            else:
+                net.skip = set(pruning["layer_indices"])
             pruned = net(frame, controls)
             net.skip = set()
             if baseline.shape != frame.shape or pruned.shape != frame.shape:
@@ -183,6 +199,8 @@ def compare_ablation(report_path, input_path=None, out_dir="out/ablation_compari
     finally:
         if net is not None:
             net.skip = set()
+            if applier is not None:
+                applier.reset()
         clear_caches()
         manifest["elapsed_seconds"] = time.perf_counter() - started
         _save_manifest(root, manifest)
