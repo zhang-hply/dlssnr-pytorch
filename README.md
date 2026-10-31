@@ -251,13 +251,44 @@ that directory maps each numbered PNG to its input filename and records the colu
 The evaluation JSON also includes this comparison manifest. All images reuse the scoring inference
 pass, and completed PNGs are preserved if evaluation is interrupted.
 
-Use `--images-out PATH` to choose a new or empty directory, or `--no-images` to produce only metrics.
+An offline interactive viewer is also generated at `out/distilled/evaluation_images/index.html`.
+Open it directly in a browser. BEFORE shows the full-model teacher by default and can switch to the
+original input; AFTER shows the distilled student. A vertical white divider reveals the left and
+right image regions as you drag with a mouse or touch. Both layers share the same image coordinates.
+Select frames by their scene paths, or use the previous/next buttons. While the divider has keyboard
+focus, Left/Right move one original-image pixel, Shift+Left/Right move ten pixels, and Home/End move
+to either edge. Reset centers the divider without changing the selected images.
+
+Separate BEFORE/AFTER file controls let you compare local images without uploading them to a server.
+Dimensions must match; failed or mismatched uploads keep the last valid comparison visible. Selecting
+another evaluation frame clears uploaded replacements. The viewer includes all CSS, JavaScript, and
+image metadata; it reads PNGs using relative paths and requires no server or network connection.
+Copy the **entire comparison directory** when sharing the viewer. The comparison manifest and CLI
+output include the HTML entry point. During evaluation or after an interruption, reopen/refresh the
+page to see the frames completed so far.
+
+Generate the same viewer from existing evaluation results, without model weights, teacher caches,
+or another inference pass:
+
+```bash
+python scripts/distill.py html --comparisons out/distilled/evaluation_images/comparison.json
+
+# Optional: choose another HTML location; PNG references are relative to that file.
+python scripts/distill.py html --comparisons out/distilled/evaluation_images/comparison.json \
+  --out out/distilled/comparison.html
+```
+
+This command locates PNGs beside the supplied manifest, so moved comparison directories work too.
+It validates the original input/teacher/student triptych PNGs and updates only the HTML file.
+
+Use `--images-out PATH` to choose a new or empty directory, or `--no-images` to produce only metrics
+without PNGs or HTML.
 By default the image directory is `<report stem>_images` beside `--out`; when `--out` is omitted it is
 `evaluation_images` beside the checkpoint. Existing nonempty image directories are rejected, so use
 a different directory when comparing another checkpoint. Training's per-epoch validation continues
 to use the TensorBoard image settings described below.
 
-All commands accept `--weights` (default `weights.safetensors`). The extraction weights are still needed
+The `prepare`, `train`, and `evaluate` commands accept `--weights` (default `weights.safetensors`). The extraction weights are still needed
 to construct the inference skeleton and must match the teacher fingerprint. The teacher targets are
 computed once, so training does not keep a teacher on the GPU. Repeating `prepare` resumes a compatible
 partial cache or reuses a complete one. Both target types are reusable across supported pruning masks.

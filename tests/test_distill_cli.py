@@ -115,7 +115,39 @@ def test_help_lists_subcommands(capsys):
         distill.main(["--help"])
     assert caught.value.code == 0
     output = capsys.readouterr().out
-    assert all(command in output for command in ("prepare", "train", "evaluate"))
+    assert all(command in output for command in ("prepare", "train", "evaluate", "html"))
+
+
+@pytest.mark.parametrize("custom", [False, True])
+def test_html_dispatches_without_model_or_cache(monkeypatch, capsys, custom):
+    calls = []
+
+    def generate(*args):
+        calls.append(args)
+        return "results/viewer.html"
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("HTML conversion must not prepare caches or run inference")
+
+    monkeypatch.setattr(distill, "generate_comparison_html", generate)
+    monkeypatch.setattr(distill, "prepare_cache", unexpected)
+    monkeypatch.setattr(distill, "evaluate_export", unexpected)
+    monkeypatch.setattr(distill, "train_distillation", unexpected)
+    arguments = ["html", "--comparisons", "results/comparison.json"]
+    if custom:
+        arguments += ["--out", "custom.html"]
+    assert distill.main(arguments) == 0
+    assert calls == [("results/comparison.json", "custom.html" if custom else None)]
+    assert "HTML viewer: results/viewer.html" in capsys.readouterr().out
+
+
+def test_evaluate_prints_html_entry_point(monkeypatch, capsys):
+    monkeypatch.setattr(distill, "evaluate_export", lambda *args, **kwargs: {
+        "metrics": {"psnr_db": 40, "psnr_uint8_db": 40, "ssim": 1},
+        "comparisons": {"directory": "results", "html": "index.html"},
+    })
+    assert distill.main(["evaluate", "--checkpoint", "model.safetensors", "--cache", "cache"]) == 0
+    assert "HTML viewer: results/index.html" in capsys.readouterr().out
 
 
 def test_prepare_can_disable_features(monkeypatch):

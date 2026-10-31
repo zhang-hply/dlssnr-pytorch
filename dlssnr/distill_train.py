@@ -15,6 +15,7 @@ from PIL import Image
 import torch
 from safetensors.torch import load_file, save_file
 
+from .comparison_html import write_comparison_html
 from .distill_data import CachedFrames, file_sha256
 from .distill_logging import image_callback, load_summary_writer, write_metrics, write_scalar
 from .distill_losses import FEATURE_BLOCKS, LEGACY_WEIGHTS, LossWeights, loss_components
@@ -224,7 +225,7 @@ def load_export(weights_path, checkpoint_path, device="cpu"):
 
 def evaluate_export(weights_path, checkpoint_path, cache_dir, out_path=None, device="auto", log=print,
                     *, on_image=None, images_out=None) -> dict:
-    """Evaluate an export, optionally saving full-resolution input/teacher/student PNGs.
+    """Evaluate an export, optionally saving full-resolution PNGs and an offline HTML viewer.
 
     images_out must be a new or empty directory. The image callback still receives
     every frame when disk comparisons are enabled; neither output needs extra inference.
@@ -248,7 +249,8 @@ def evaluate_export(weights_path, checkpoint_path, cache_dir, out_path=None, dev
             raise ValueError("evaluation images output must be a new or empty directory; choose another --images-out")
         filenames = [f"{index:06d}_{Path(entry['name']).stem}.png"
                      for index, entry in enumerate(dataset.entries)]
-        image_artifacts = {images_root / name for name in filenames} | {images_root / "comparison.json"}
+        image_artifacts = {images_root / name for name in filenames} | {
+            images_root / "comparison.json", images_root / "index.html"}
         if destination is not None and (destination in image_artifacts or destination == images_root
                                         or destination in images_root.parents):
             raise ValueError("evaluation report would overwrite comparison output")
@@ -267,9 +269,16 @@ def evaluate_export(weights_path, checkpoint_path, cache_dir, out_path=None, dev
         images_root.mkdir(parents=True, exist_ok=True)
         comparisons = {"status": "running", "directory": str(images_root),
                        "checkpoint": str(Path(checkpoint_path).expanduser().resolve()),
+                       "html": "index.html", "width": dataset.width, "height": dataset.height,
                        "side_by_side_order": ["input", "teacher", "student"], "images": []}
+
+    def save_comparisons():
         _write_json(images_root / "comparison.json", comparisons)
-        log(f"Saving evaluation comparisons to {images_root}: input | teacher | student")
+        write_comparison_html(comparisons, images_root, validate_images=False)
+
+    if comparisons is not None:
+        save_comparisons()
+        log(f"Saving evaluation comparisons to {images_root}: input | teacher | student; viewer: index.html")
 
     def record_image(index, name, input_frame, target_frame, output_frame):
         if images_root is not None:
@@ -277,7 +286,7 @@ def evaluate_export(weights_path, checkpoint_path, cache_dir, out_path=None, dev
             pixels = np.concatenate((input_frame, target_frame, output_frame), axis=1)
             _atomic_write(path, lambda temporary: Image.fromarray(pixels).save(temporary, format="PNG"))
             comparisons["images"].append({"name": name, "file": path.name})
-            _write_json(images_root / "comparison.json", comparisons)
+            save_comparisons()
             log(f"Comparison {index + 1}/{len(dataset)} saved: {path}")
         if on_image is not None:
             on_image(index, name, input_frame, target_frame, output_frame)
@@ -289,12 +298,15 @@ def evaluate_export(weights_path, checkpoint_path, cache_dir, out_path=None, dev
         if comparisons is not None:
             comparisons["status"] = "interrupted" if isinstance(error, KeyboardInterrupt) else "error"
             comparisons["error"] = f"{type(error).__name__}: {error}"
-            _write_json(images_root / "comparison.json", comparisons)
+            try:
+                save_comparisons()
+            except (OSError, ValueError) as report_error:
+                error.add_note(f"Could not update comparison viewer: {report_error}")
         raise
     result = {"metadata": metadata, "metrics": metrics}
     if comparisons is not None:
         comparisons["status"] = "completed"
-        _write_json(images_root / "comparison.json", comparisons)
+        save_comparisons()
         result["comparisons"] = comparisons
     if destination is not None:
         _write_json(destination, result)

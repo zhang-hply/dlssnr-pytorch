@@ -428,6 +428,8 @@ def test_evaluation_saves_all_side_by_side_images_in_one_pass(training, monkeypa
     assert manifest == result["comparisons"] == json.loads(report_path.read_text())["comparisons"]
     assert manifest["status"] == "completed"
     assert manifest["side_by_side_order"] == ["input", "teacher", "student"]
+    assert manifest["html"] == "index.html"
+    assert (images / "index.html").is_file()
     assert len(manifest["images"]) == len(list(images.glob("*.png"))) == 4
     for index, (row, (name, expected)) in enumerate(zip(manifest["images"], callbacks)):
         assert row["name"] == name == f"{index}.png"
@@ -440,7 +442,7 @@ def test_evaluation_saves_all_side_by_side_images_in_one_pass(training, monkeypa
     assert not list(images.glob("*.tmp"))
 
 
-@pytest.mark.parametrize("conflict", ["nonempty", "input", "report_manifest", "report_png", "report_directory"])
+@pytest.mark.parametrize("conflict", ["nonempty", "input", "report_manifest", "report_png", "report_directory", "report_html"])
 def test_evaluation_comparisons_reject_output_conflicts_before_inference(training, monkeypatch, conflict):
     train(training)
     checkpoint = training["out"] / "best.safetensors"
@@ -455,6 +457,8 @@ def test_evaluation_comparisons_reject_output_conflicts_before_inference(trainin
         report_path = images / "comparison.json"
     elif conflict == "report_png":
         report_path = images / "000000_0.png"
+    elif conflict == "report_html":
+        report_path = images / "index.html"
     else:
         report_path = images
 
@@ -486,9 +490,44 @@ def test_evaluation_interruption_preserves_completed_comparisons(training):
                                device="cpu", log=lambda _: None, images_out=images, on_image=interrupt)
     manifest = json.loads((images / "comparison.json").read_text())
     assert manifest["status"] == "interrupted" and len(manifest["images"]) == 1
+    html = (images / "index.html").read_text()
+    assert "interrupted" in html and manifest["images"][0]["file"] in html
     with Image.open(images / manifest["images"][0]["file"]) as image:
         image.verify()
     assert not list(images.glob("*.tmp"))
+
+
+def test_metrics_only_evaluation_does_not_generate_viewer(training, monkeypatch):
+    train(training)
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("metrics-only evaluation must not generate HTML")
+
+    monkeypatch.setattr(engine, "write_comparison_html", unexpected)
+    result = engine.evaluate_export(training["source"], training["out"] / "best.safetensors",
+                                    training["val"], device="cpu", log=lambda _: None)
+    assert "comparisons" not in result
+    assert not list(training["out"].rglob("*.html"))
+
+
+def test_viewer_write_failure_preserves_original_error_and_completed_png(training, monkeypatch):
+    train(training)
+    images = training["out"] / "evaluation_images"
+    original = engine.write_comparison_html
+
+    def broken(comparisons, *args, **kwargs):
+        if comparisons["images"]:
+            raise OSError("viewer write failed")
+        return original(comparisons, *args, **kwargs)
+
+    monkeypatch.setattr(engine, "write_comparison_html", broken)
+    with pytest.raises(OSError, match="viewer write failed") as error:
+        engine.evaluate_export(training["source"], training["out"] / "best.safetensors", training["val"],
+                               device="cpu", log=lambda _: None, images_out=images)
+    manifest = json.loads((images / "comparison.json").read_text())
+    assert manifest["status"] == "error" and len(manifest["images"]) == 1
+    assert (images / manifest["images"][0]["file"]).is_file()
+    assert any("Could not update comparison viewer" in note for note in error.value.__notes__)
 
 
 @pytest.mark.parametrize("override", [{"epochs": 0}, {"accumulation": 0}, {"patience": 0},
