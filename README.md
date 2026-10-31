@@ -209,6 +209,22 @@ and reports. Repeated filenames across scenes are supported; flat directories an
 still work. Keep entire scenes in one split. If source images were moved after caching, prepare a
 new cache directory: existing caches remain tied to their original source paths.
 
+To remove byte-identical images shared with training from the validation dataset, use:
+
+```bash
+# Preview matches, including SHA-256 hashes and source paths.
+python scripts/remove_val_duplicates.py --train-dir data/train --val-dir data/val --dry-run
+
+# Remove the matching validation files.
+python scripts/remove_val_duplicates.py --train-dir data/train --val-dir data/val
+```
+
+The script recursively hashes the current image files using SHA-256, including scene subdirectories.
+It preserves training files, nonmatching validation files, and non-image files. Symlinked images and
+directories are skipped and reported; identical or nested train/validation roots are rejected.
+After removals, regenerate the validation teacher cache in a **new** directory and start a new run
+using that cache. Exact duplicate removal does not replace splitting whole scenes between datasets.
+
 ```bash
 # Generate RGB targets and selected internal features with the complete frozen teacher.
 python scripts/distill.py prepare --input data/train --out out/teacher_train --device cuda
