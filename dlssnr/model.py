@@ -120,8 +120,8 @@ class NRNet(nn.Module):
         result = tensor_to_frame(_main(outputs[len(self.plan) - 1]), self.width, self.height)
         return (result, outputs) if capture else result
 
-    def run(self, image: torch.Tensor, controls=None, capture: bool = False) -> dict[int, object]:
-        """Run every layer on the padded ``image`` tensor and return the kept outputs."""
+    def run(self, image: torch.Tensor, controls=None, capture: bool = False, *, on_layer=None) -> dict[int, object]:
+        """Run layers and return kept outputs; optional on_layer(spec, value) observes before freeing."""
         outputs: dict[int, object] = {}
         int4.reset()
         for spec, layer in zip(self.plan, self.layers):
@@ -145,6 +145,8 @@ class NRNet(nn.Module):
                 if spec.kind == "DecInputUpsample":
                     skip_value = _main(skip_value)
                 outputs[i] = layer(_main(previous), skip_value)
+            if on_layer is not None:
+                on_layer(spec, outputs[i])
             if not capture:
                 for j in [j for j in outputs if self.last_use[j] <= i and j != i]:
                     del outputs[j]

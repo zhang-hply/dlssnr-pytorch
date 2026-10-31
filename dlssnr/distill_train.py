@@ -17,6 +17,7 @@ from safetensors.torch import load_file, save_file
 
 from .distill_data import CachedFrames, file_sha256
 from .distill_logging import image_callback, load_summary_writer, write_metrics, write_scalar
+from .distill_losses import FEATURE_BLOCKS, LEGACY_WEIGHTS, LossWeights, loss_components
 from .distillation import DistilledStudent, read_pruning_report, require_reference, validate_pruning
 from .io import Controls, frame_to_tensor, tensor_to_frame
 from .metrics import ssim
@@ -36,8 +37,18 @@ class TrainConfig:
     patience: int = 5
     seed: int = 0
     checkpoint_blocks: bool = True
+    rgb_weight: float = 1.0
+    edge_weight: float = 0.1
+    ssim_weight: float = 0.1
+    multiscale_weight: float = 0.1
+    feature_weight: float = 0.05
+
+    @property
+    def loss_weights(self):
+        return LossWeights(**{key: getattr(self, key) for key in asdict(LossWeights())})
 
     def validate(self) -> None:
+        self.loss_weights.validate()
         if self.epochs < 1 or self.accumulation < 1 or self.patience < 1:
             raise ValueError("epochs, accumulation and patience must be positive")
         if not all(math.isfinite(value) and value > 0 for value in (
@@ -48,15 +59,8 @@ class TrainConfig:
 
 
 def distillation_loss(prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    """L1 plus 0.1 times the mean horizontal/vertical finite-difference L1."""
-    if prediction.shape != target.shape or prediction.ndim != 4:
-        raise ValueError("prediction and target must have matching NCHW shapes")
-    pixel = (prediction - target).abs().mean()
-    horizontal = ((prediction[..., 1:] - prediction[..., :-1]) -
-                  (target[..., 1:] - target[..., :-1])).abs().mean() if prediction.shape[-1] > 1 else pixel * 0
-    vertical = ((prediction[..., 1:, :] - prediction[..., :-1, :]) -
-                (target[..., 1:, :] - target[..., :-1, :])).abs().mean() if prediction.shape[-2] > 1 else pixel * 0
-    return pixel + 0.05 * (horizontal + vertical)
+    """Compatibility wrapper for the original RGB-plus-edge objective."""
+    return loss_components(prediction, target, LEGACY_WEIGHTS)["loss"]
 
 
 def _safe_json(value):
@@ -105,12 +109,13 @@ def _check_data(train: CachedFrames, validation: CachedFrames) -> None:
         raise ValueError("training and validation contain identical source images; split by scene first")
 
 
-def evaluate_network(net, dataset: CachedFrames, device="auto", log=print, *, on_image=None) -> dict:
+def evaluate_network(net, dataset: CachedFrames, device="auto", log=print, *, on_image=None,
+                     loss_weights=LEGACY_WEIGHTS) -> dict:
     """Score the ordinary inference graph against float targets and their 8-bit frames."""
     require_reference(net)
     device = resolve_device(str(device))
     squared, byte_squared, elements = 0.0, 0.0, 0
-    loss_sum = 0.0
+    component_sums = {}
     structures, per_image = [], []
     started = time.perf_counter()
     clear_caches()
@@ -122,17 +127,31 @@ def evaluate_network(net, dataset: CachedFrames, device="auto", log=print, *, on
                 log(f"Validation {index + 1}/{len(dataset)}: {item['name']} starting")
                 image_started = time.perf_counter()
                 image = frame_to_tensor(item["input"], device)
-                outputs = net.run(image, Controls(), capture=False)
+                features = {}
+
+                def capture_feature(spec, value):
+                    if spec.block in FEATURE_BLOCKS:
+                        features[spec.block] = value[0] if isinstance(value, tuple) else value
+
+                options = {"on_layer": capture_feature} if loss_weights.feature_weight and dataset.features else {}
+                outputs = net.run(image, Controls(), capture=False, **options)
                 value = outputs[net.plan[-1].index]
                 if isinstance(value, tuple):
                     value = value[0]
-                prediction = value[..., :dataset.height, :dataset.width].float().cpu()
+                prediction = value[..., :dataset.height, :dataset.width].float()
                 target = item["target"]
                 if prediction.shape != target.shape or not torch.isfinite(prediction).all().item():
                     raise ValueError("inference returned an invalid image")
+                terms = loss_components(prediction, target, loss_weights, features=features or None,
+                                        teacher_features=item.get("features"), allow_missing_features=True)
+                components = {key: None if value is None else float(value) for key, value in terms.items()}
+                for key, value in components.items():
+                    if value is not None and not math.isfinite(value):
+                        raise ValueError(f"inference returned nonfinite {key} loss")
+                    component_sums[key] = None if value is None else component_sums.get(key, 0.0) + value
+                loss = components["loss"]
+                prediction = prediction.cpu()
                 mse = float((prediction.double() - target.double()).square().mean())
-                loss = float(distillation_loss(prediction, target))
-                loss_sum += loss
                 output_frame = tensor_to_frame(prediction, dataset.width, dataset.height)
                 target_frame = tensor_to_frame(target, dataset.width, dataset.height)
                 byte_mse = float(np.square(output_frame.astype(np.float64) - target_frame.astype(np.float64)).mean())
@@ -142,20 +161,24 @@ def evaluate_network(net, dataset: CachedFrames, device="auto", log=print, *, on
                 squared += mse * target.numel()
                 byte_squared += byte_mse * target.numel()
                 elements += target.numel()
-                per_image.append({"name": item["name"], "loss": loss, "mse": mse, "psnr_db": _psnr(mse),
+                per_image.append({"name": item["name"], "loss": loss, "loss_components": components,
+                                  "mse": mse, "psnr_db": _psnr(mse),
                                   "mse_uint8": byte_mse, "psnr_uint8_db": _psnr(byte_mse, 255),
                                   "ssim": structure, "seconds": time.perf_counter() - image_started})
                 log(f"Validation {index + 1}/{len(dataset)}: MSE={mse:.8g}, "
                     f"PSNR={_psnr(mse):.2f}dB, uint8 PSNR={_psnr(byte_mse, 255):.2f}dB")
                 if on_image is not None:
                     on_image(index, item["name"], item["input"], target_frame, output_frame)
-                del outputs, value, image
+                del outputs, value, image, features, terms
     finally:
         net.to("cpu")
         clear_caches()
         if device.type == "cuda":
             torch.cuda.empty_cache()
-    return {"loss": loss_sum / len(dataset), "mse": squared / elements, "psnr_db": _psnr(squared / elements),
+    components = {key: None if value is None else value / len(dataset) for key, value in component_sums.items()}
+    return {"loss": components["loss"], "image_loss": components["image_loss"], "loss_components": components,
+            "feature_loss_available": not loss_weights.feature_weight or dataset.features is not None,
+            "mse": squared / elements, "psnr_db": _psnr(squared / elements),
             "mse_uint8": byte_squared / elements, "psnr_uint8_db": _psnr(byte_squared / elements, 255),
             "ssim": float(np.mean(structures)) if structures else None,
             "seconds": time.perf_counter() - started, "per_image": per_image}
@@ -230,6 +253,14 @@ def evaluate_export(weights_path, checkpoint_path, cache_dir, out_path=None, dev
                                         or destination in images_root.parents):
             raise ValueError("evaluation report would overwrite comparison output")
     net, metadata = load_export(source, checkpoint_path)
+    loss_weights = LossWeights.from_metadata(metadata.get("config", {}))
+    loss_weights.validate()
+    if loss_weights.feature_weight and (dataset.root / "features" / "manifest.json").exists():
+        dataset = CachedFrames(cache_dir, weights_hash=file_sha256(source), features=True)
+    if destination is not None:
+        feature_root = dataset.root / "features"
+        if destination == feature_root or feature_root in destination.parents:
+            raise ValueError("evaluation report would overwrite feature cache artifacts")
     if (dataset.width, dataset.height) != (metadata["width"], metadata["height"]):
         raise ValueError("evaluation cache dimensions differ from the distilled model")
     if images_root is not None:
@@ -252,7 +283,7 @@ def evaluate_export(weights_path, checkpoint_path, cache_dir, out_path=None, dev
             on_image(index, name, input_frame, target_frame, output_frame)
 
     try:
-        metrics = evaluate_network(net, dataset, device, log,
+        metrics = evaluate_network(net, dataset, device, log, loss_weights=loss_weights,
                                    on_image=record_image if images_root is not None else on_image)
     except (Exception, KeyboardInterrupt) as error:
         if comparisons is not None:
@@ -299,6 +330,16 @@ def _write_training_report(destination: Path, report: dict) -> None:
         lines.append(f"| {epoch['epoch']} | {epoch['loss']:.8g} | {validation_loss} | {metrics['mse']:.8g} | "
                      f"{metrics['psnr_db']:.4f} | {metrics['psnr_uint8_db']:.4f} | "
                      f"{structure} | {epoch['learning_rate']:.8g} |")
+    lines += ["", "Loss components (raw terms; image_loss and loss are weighted):", "",
+              "| Epoch | Set | RGB | Edge | SSIM loss | Multiscale | Feature | Image loss | Total |",
+              "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"]
+    for epoch in report["history"]:
+        for name, values in (("train", epoch.get("loss_components", {})),
+                             ("val", epoch["validation"].get("loss_components", {}))):
+            if values:
+                cells = ["N/A" if values.get(key) is None else f"{values[key]:.8g}"
+                         for key in ("rgb", "edge", "ssim", "multiscale", "feature", "image_loss", "loss")]
+                lines.append(f"| {epoch['epoch']} | {name} | " + " | ".join(cells) + " |")
     lines += ["", f"Peak GPU allocation: {report.get('peak_memory_bytes', 0) / 2**30:.3f} GiB",
               f"Elapsed: {report.get('elapsed_seconds', 0):.2f} s", "",
               "Resume checkpoints are saved at completed epoch boundaries. "
@@ -316,9 +357,9 @@ def train_distillation(weights_path, pruning_report, train_cache, val_cache, out
     source, destination = Path(weights_path).expanduser().resolve(), Path(out_dir).expanduser().resolve()
     weights_hash = file_sha256(source)
     log("Validating training cache, source hashes and floating-point targets")
-    train = CachedFrames(train_cache, weights_hash)
+    train = CachedFrames(train_cache, weights_hash, features=config.feature_weight > 0)
     log("Validating held-out cache, source hashes and floating-point targets")
-    validation = CachedFrames(val_cache, weights_hash)
+    validation = CachedFrames(val_cache, weights_hash, features=config.feature_weight > 0)
     _check_data(train, validation)
     pruning = read_pruning_report(pruning_report, build_plan(train.width, train.height))
     if destination == train.root or destination == validation.root or destination in (source, Path(pruning_report).resolve()):
@@ -334,6 +375,9 @@ def train_distillation(weights_path, pruning_report, train_cache, val_cache, out
                 "dropped_blocks": pruning["blocks"], "pruning": pruning,
                 "train_manifest_sha256": file_sha256(train.root / "manifest.json"),
                 "val_manifest_sha256": file_sha256(validation.root / "manifest.json"),
+                "train_features_sha256": file_sha256(train.features.path) if train.features else None,
+                "val_features_sha256": file_sha256(validation.features.path) if validation.features else None,
+                "feature_blocks": list(FEATURE_BLOCKS) if config.feature_weight else None,
                 "train_cache": str(train.root), "val_cache": str(validation.root),
                 "config": asdict(config), "device": str(device), "torch_version": str(torch.__version__)}
     restored = torch.load(str(resume), map_location="cpu", weights_only=True) if resume is not None else None
@@ -341,8 +385,11 @@ def train_distillation(weights_path, pruning_report, train_cache, val_cache, out
         if restored.get("schema_version") != 1:
             raise ValueError("unsupported training checkpoint")
         _validate_metadata(restored.get("metadata"), weights_hash)
+        old_config = restored["metadata"].get("config", {})
+        restored["metadata"]["config"] = {**old_config, **asdict(LossWeights.from_metadata(old_config))}
         for field in ("width", "height", "controls", "dropped_blocks", "train_manifest_sha256",
-                      "val_manifest_sha256", "config"):
+                      "val_manifest_sha256", "config", "train_features_sha256", "val_features_sha256",
+                      "feature_blocks"):
             if restored["metadata"].get(field) != metadata[field]:
                 raise ValueError(f"resume checkpoint has different {field}")
         # last.pt refers to the best artifact in the same run directory.
@@ -398,7 +445,18 @@ def train_distillation(weights_path, pruning_report, train_cache, val_cache, out
     def validate_student():
         inference.load_state_dict(student.export_state(), strict=True)
         return evaluate_network(inference, validation, device, log,
+                                loss_weights=config.loss_weights,
                                 on_image=image_callback(writer, "val", report["global_step"]))
+
+    def student_loss(item):
+        image = frame_to_tensor(item["input"], device)
+        features = None
+        if config.feature_weight:
+            prediction, features = student(image, return_features=True)
+        else:
+            prediction = student(image)
+        return loss_components(prediction, item["target"], config.loss_weights,
+                               features=features, teacher_features=item.get("features"))
 
     try:
         if writer_type is not None:
@@ -422,14 +480,14 @@ def train_distillation(weights_path, pruning_report, train_cache, val_cache, out
         log("Preflight: full-frame forward and backward, without updating weights")
         student.train()
         first = train[0]
-        prediction = student(frame_to_tensor(first["input"], device))
-        loss = distillation_loss(prediction, first["target"].to(device))
+        terms = student_loss(first)
+        loss = terms["loss"]
         if not torch.isfinite(loss).item():
             raise ValueError("preflight loss is nonfinite")
         loss.backward()
         torch.nn.utils.clip_grad_norm_(student.parameters(), config.grad_clip, error_if_nonfinite=True)
         optimizer.zero_grad(set_to_none=True)
-        del prediction, loss, first
+        del terms, loss, first
         if device.type == "cuda":
             report["preflight_peak_memory_bytes"] = torch.cuda.max_memory_allocated(device)
         log(f"Preflight complete; peak allocation={report['preflight_peak_memory_bytes'] / 2**30:.3f} GiB")
@@ -443,16 +501,24 @@ def train_distillation(weights_path, pruning_report, train_cache, val_cache, out
             order = torch.randperm(len(train), generator=torch.Generator().manual_seed(config.seed + epoch)).tolist()
             loss_sum, learning_rate = 0.0, optimizer.param_groups[0]["lr"]
             group_loss = 0.0
+            epoch_components, group_components = {}, {}
             epoch_started = time.perf_counter()
             for position, index in enumerate(order):
                 item = train[index]
-                prediction = student(frame_to_tensor(item["input"], device))
-                loss = distillation_loss(prediction, item["target"].to(device))
+                terms = student_loss(item)
+                loss = terms["loss"]
                 loss_value = float(loss.detach())
                 if not math.isfinite(loss_value):
                     raise ValueError("training loss is nonfinite")
                 loss_sum += loss_value
                 group_loss += loss_value
+                for key, value in terms.items():
+                    scalar = float(value.detach())
+                    if not math.isfinite(scalar):
+                        raise ValueError(f"training {key} loss is nonfinite")
+                    epoch_components[key] = epoch_components.get(key, 0.0) + scalar
+                    group_components[key] = group_components.get(key, 0.0) + scalar
+                del value
                 group_start = position - position % config.accumulation
                 group_size = min(config.accumulation, len(train) - group_start)
                 (loss / group_size).backward()
@@ -463,12 +529,15 @@ def train_distillation(weights_path, pruning_report, train_cache, val_cache, out
                     optimizer.zero_grad(set_to_none=True)
                     report["global_step"] += 1
                     write_scalar(writer, "train/loss_step", group_loss / group_size, report["global_step"])
+                    for key, value in group_components.items():
+                        write_scalar(writer, f"train/components_step/{key}", value / group_size, report["global_step"])
                     write_scalar(writer, "train/learning_rate", learning_rate, report["global_step"])
                     write_scalar(writer, "train/grad_norm", grad_norm, report["global_step"])
                     group_loss = 0.0
+                    group_components = {}
                 log(f"Epoch {epoch + 1}/{config.epochs} image {position + 1}/{len(order)} "
                     f"{item['name']}: loss={loss_value:.8g}, step={report['global_step']}, lr={learning_rate:.4g}")
-                del prediction, loss, item
+                del terms, loss, item
             metrics = validate_student()
             improved = metrics["mse"] < report["best"]["mse"]
             if improved:
@@ -478,6 +547,7 @@ def train_distillation(weights_path, pruning_report, train_cache, val_cache, out
             completed = epoch + 1
             report["completed_epochs"] = completed
             report["history"].append({"epoch": completed, "loss": loss_sum / len(train),
+                                      "loss_components": {key: value / len(train) for key, value in epoch_components.items()},
                                       "learning_rate": learning_rate, "validation": metrics,
                                       "seconds": time.perf_counter() - epoch_started})
             scheduler.step()
@@ -488,6 +558,8 @@ def train_distillation(weights_path, pruning_report, train_cache, val_cache, out
             save_checkpoint(destination / "last.pt")
             step = report["global_step"]
             write_scalar(writer, "train/loss_epoch", loss_sum / len(train), step)
+            for key, value in epoch_components.items():
+                write_scalar(writer, f"train/components_epoch/{key}", value / len(train), step)
             write_scalar(writer, "train/epoch", completed, step)
             write_metrics(writer, "val", metrics, step)
             write_scalar(writer, "best/mse", report["best"]["mse"], step)

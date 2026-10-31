@@ -21,6 +21,7 @@ from torch.utils.checkpoint import checkpoint
 
 from . import int4, int8, quant
 from .ablation import layer_macs, units
+from .distill_losses import FEATURE_BLOCKS
 from .io import Controls
 from .layers import decoder, pre_post, split_swin, swin, vit
 from .model import NRNet, _main
@@ -211,13 +212,17 @@ class DistilledStudent(nn.Module):
             outputs[spec.index] = previous = value
         return tuple(outputs[index] for index in retained_indices)
 
-    def forward(self, image: torch.Tensor) -> torch.Tensor:
+    def forward(self, image: torch.Tensor, *, return_features: bool = False):
+        """Return cropped RGB, or (RGB, block-keyed features) with live gradients."""
         require_reference(self.net)
         shape = (1, 3, self.net.padding.height, self.net.padding.width)
         if tuple(image.shape) != shape or image.dtype != torch.float32:
             raise ValueError(f"expected padded float32 input {shape}, got {tuple(image.shape)} {image.dtype}")
         if self.net.skip != set(self.pruning["layer_indices"]):
             raise ValueError("the student's fixed whole-block pruning mask was modified")
+        if return_features and not set(FEATURE_BLOCKS).issubset({s.block for s in self.net.plan}):
+            raise ValueError(f"feature supervision requires blocks {FEATURE_BLOCKS}")
+        features = {}
         outputs: dict[int, object] = {}
         int4.reset()
         with distillation_mode():
@@ -240,10 +245,13 @@ class DistilledStudent(nn.Module):
                     else:
                         values = run(*args)
                 outputs.update(zip(retained, values))
+                if return_features and specs[0].block in FEATURE_BLOCKS:
+                    features[specs[0].block] = _main(outputs[last])
                 for index in [index for index in outputs
                               if self.net.last_use[index] <= last and index != last]:
                     del outputs[index]
-        return _main(outputs[len(self.net.plan) - 1])[..., :self.net.height, :self.net.width]
+        prediction = _main(outputs[len(self.net.plan) - 1])[..., :self.net.height, :self.net.width]
+        return (prediction, features) if return_features else prediction
 
     def export_state(self) -> dict[str, torch.Tensor]:
         """Materialize quantized weights under original NRNet keys, on the CPU.

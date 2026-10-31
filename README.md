@@ -202,8 +202,15 @@ dimensions. Images are never resized. Generate caches on the training machine: t
 the original image paths and verify image and weight hashes. At 1080p, each float32 RGB target takes
 about 25 MB before filesystem overhead.
 
+`prepare --input data/train` searches recursively, including layouts such as
+`data/train/scene1/frame.png` and `data/train/scene2/frame.png`. Frames are sorted by their paths
+relative to the input directory, and names like `scene1/frame.png` are preserved in caches, logs,
+and reports. Repeated filenames across scenes are supported; flat directories and individual images
+still work. Keep entire scenes in one split. If source images were moved after caching, prepare a
+new cache directory: existing caches remain tied to their original source paths.
+
 ```bash
-# Generate full-frame floating-point targets with the complete frozen teacher.
+# Generate RGB targets and selected internal features with the complete frozen teacher.
 python scripts/distill.py prepare --input data/train --out out/teacher_train --device cuda
 python scripts/distill.py prepare --input data/val --out out/teacher_val --device cuda
 
@@ -237,12 +244,63 @@ to use the TensorBoard image settings described below.
 All commands accept `--weights` (default `weights.safetensors`). The extraction weights are still needed
 to construct the inference skeleton and must match the teacher fingerprint. The teacher targets are
 computed once, so training does not keep a teacher on the GPU. Repeating `prepare` resumes a compatible
-partial cache or reuses a complete one.
+partial cache or reuses a complete one. Both target types are reusable across supported pruning masks.
+
+New runs enable internal feature matching, structural similarity, and multiscale image supervision:
+
+| Term | Definition | Flag | Default weight |
+| --- | --- | --- | ---: |
+| RGB | Mean absolute RGB error | `--rgb-weight` | 1.0 |
+| Edge | Mean horizontal/vertical finite-difference L1 | `--edge-weight` | 0.1 |
+| SSIM | `1 - SSIM` on float RGB, 11x11 Gaussian window, sigma 1.5 | `--ssim-weight` | 0.1 |
+| Multiscale | Mean RGB L1 at half, quarter and eighth resolution, area downsampling | `--multiscale-weight` | 0.1 |
+| Feature | Mean normalized feature L1 at blocks 14, 22, 39 and 56 | `--feature-weight` | 0.05 |
+
+The total is the weighted sum. Feature error at each tap is divided by that teacher tensor's RMS,
+floored at `1e-3`, then averaged equally across taps. These encoder/decoder stages cannot be pruned.
+Losses run in FP32 with detached teacher targets; only the loss pyramid downsamples images. The SSIM
+loss uses replicate padding (including tiny images), separately from the existing uint8 SSIM metric.
+The coefficients are starting values to compare on held-out scenes, not a guarantee against overfitting.
+
+**Upgrade existing RGB caches once** by rerunning the same `prepare` commands for training and
+validation. This adds FP16 features under `<cache>/features/`, with a separate manifest binding the
+RGB cache, taps, shapes and file hashes. Original RGB files and their manifest stay unchanged. Fresh
+caches generate RGB and features in one pass per image; upgrades run the teacher only for missing
+features. At 1080p the four feature tensors add about 16 MiB per frame. No teacher is loaded during
+student training, and exported inference weights retain the existing format.
+
+```bash
+# Upgrade using the same original source images and teacher weights.
+python scripts/distill.py prepare --input data/train --out out/teacher --device cuda
+python scripts/distill.py prepare --input data/val --out out/teacher_val --device cuda
+
+# Both supervision types are enabled by default. Use a new run directory.
+python scripts/distill.py train --pruning-report out/ablation.json \
+  --train-cache out/teacher --val-cache out/teacher_val --out out/distilled_combined \
+  --device cuda --tensorboard
+```
+
+Set any weight to zero to disable that term. `--feature-weight 0` permits RGB-only caches while
+retaining structural/multiscale losses. Set `--ssim-weight 0 --multiscale-weight 0 --feature-weight 0`
+to recover the original RGB-plus-edge objective. `prepare --no-features` prepares RGB targets only.
+Weights must be finite and nonnegative, with at least one positive term.
+
+Training and validation report raw components, the weighted image subtotal, and the weighted total
+in `report.json`, `report.md`, and TensorBoard. Step/epoch component tags use
+`train/components_step/*` and `train/components_epoch/*`; validation uses `val/loss_components/*`.
+Best-checkpoint selection and early stopping still use validation MSE, regardless of loss weights.
+Standalone evaluation uses the export's loss configuration. If its feature loss is enabled but the
+evaluation cache has no features, image metrics remain available; feature and total loss are `null`,
+and `feature_loss_available` is false. Incomplete or incompatible feature caches are rejected.
+
+Resume requires the same loss weights and feature-cache fingerprints. For checkpoints predating
+these losses, pass `--ssim-weight 0 --multiscale-weight 0 --feature-weight 0` along with the original
+training settings. Changing the objective requires a fresh run; older inference exports remain loadable.
 
 Training defaults are 20 epochs, AdamW without weight decay, learning rate `1e-5` with cosine decay to
 `1e-6`, gradient accumulation over four frames, gradient clipping at 1.0 and five-epoch early stopping.
-The loss is L1 plus 0.1 times the mean horizontal/vertical edge L1. Whole-block non-reentrant activation
-checkpointing is enabled; `--no-checkpoint` disables it. A full-frame backward preflight checks gradients
+Whole-block non-reentrant activation checkpointing is enabled; `--no-checkpoint` disables it.
+A full-frame backward preflight checks gradients
 and records memory before optimizer updates; Adam's states allocate additional memory on the first
 update. Peak memory for the full run is also recorded. Training is intended for the requested 24GB GPU;
 the preflight reports actual capacity failures without changing resolution.

@@ -12,7 +12,8 @@ from scripts import distill
 def test_prepare_dispatches_paths_device_and_progress(monkeypatch, capsys):
     calls = []
 
-    def prepare(*arguments):
+    def prepare(*arguments, **options):
+        assert options == {"features": True}
         calls.append(arguments)
         arguments[-1]("preparing fake teacher")
         return {"images": [{"name": "one.png"}]}
@@ -91,7 +92,7 @@ def test_evaluate_dispatches_and_prints_metrics(monkeypatch, capsys, extra, repo
     (KeyboardInterrupt(), 130, "epoch-boundary checkpoints are preserved"),
 ])
 def test_known_failures_return_exit_code_and_actionable_error(monkeypatch, capsys, error, exit_code, expected):
-    def fail(*arguments):
+    def fail(*arguments, **options):
         raise error
 
     monkeypatch.setattr(distill, "prepare_cache", fail)
@@ -115,3 +116,34 @@ def test_help_lists_subcommands(capsys):
     assert caught.value.code == 0
     output = capsys.readouterr().out
     assert all(command in output for command in ("prepare", "train", "evaluate"))
+
+
+def test_prepare_can_disable_features(monkeypatch):
+    calls = []
+
+    def prepare(*args, **kwargs):
+        calls.append(kwargs)
+        return {"images": []}
+
+    monkeypatch.setattr(distill, "prepare_cache", prepare)
+    assert distill.main(["prepare", "--input", "images", "--out", "cache", "--no-features"]) == 0
+    assert calls == [{"features": False}]
+
+
+def test_loss_weight_flags_and_defaults(monkeypatch):
+    configs = []
+
+    def train(*args, **kwargs):
+        configs.append(args[6])
+        return {"status": "completed", "best_epoch": 1, "improved": True,
+                "export_validation": {"psnr_db": 40}}
+
+    monkeypatch.setattr(distill, "train_distillation", train)
+    arguments = ["train", "--pruning-report", "mask.json", "--train-cache", "train", "--val-cache", "val"]
+    assert distill.main(arguments) == 0
+    assert (configs[-1].rgb_weight, configs[-1].edge_weight, configs[-1].ssim_weight,
+            configs[-1].multiscale_weight, configs[-1].feature_weight) == (1, 0.1, 0.1, 0.1, 0.05)
+    assert distill.main(arguments + ["--rgb-weight", "0.8", "--edge-weight", "0.2", "--ssim-weight", "0",
+                                    "--multiscale-weight", "0", "--feature-weight", "0"]) == 0
+    assert (configs[-1].rgb_weight, configs[-1].edge_weight, configs[-1].ssim_weight,
+            configs[-1].multiscale_weight, configs[-1].feature_weight) == (0.8, 0.2, 0, 0, 0)

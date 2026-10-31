@@ -31,8 +31,9 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     commands = parser.add_subparsers(dest="command", required=True)
     prepare = commands.add_parser("prepare", help="generate or resume full-model floating-point targets")
-    prepare.add_argument("--input", required=True)
+    prepare.add_argument("--input", required=True, help="image file or directory searched recursively (e.g. data/train/scene/frame.png)")
     prepare.add_argument("--out", required=True)
+    prepare.add_argument("--no-features", action="store_true", help="prepare only RGB targets (legacy workflow)")
     train = commands.add_parser("train", help="recover the best pruning-report mask with all retained weights")
     train.add_argument("--pruning-report", required=True)
     train.add_argument("--train-cache", required=True)
@@ -47,6 +48,9 @@ def main(argv=None) -> int:
     train.add_argument("--patience", type=int, default=5)
     train.add_argument("--seed", type=int, default=0, help="training shuffle seed; Controls.seed stays zero")
     train.add_argument("--no-checkpoint", action="store_true", help="disable block activation checkpointing")
+    for name, default in (("rgb", 1.0), ("edge", 0.1), ("ssim", 0.1), ("multiscale", 0.1), ("feature", 0.05)):
+        train.add_argument(f"--{name}-weight", type=float, default=default,
+                           help=f"{name} loss weight (default: {default}; zero disables)")
     train.add_argument("--tensorboard", action="store_true",
                        help="record curves and full-resolution validation comparisons in <out>/tensorboard")
     evaluate = commands.add_parser("evaluate", help="evaluate best.safetensors via the ordinary inference graph")
@@ -63,11 +67,14 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     try:
         if args.command == "prepare":
-            manifest = prepare_cache(args.input, args.out, args.weights, args.device, log)
+            manifest = prepare_cache(args.input, args.out, args.weights, args.device, log, features=not args.no_features)
             log(f"Teacher cache complete: {len(manifest['images'])} images, {args.out}")
         elif args.command == "train":
             config = TrainConfig(args.epochs, args.lr, args.min_lr, args.accumulation,
-                                 args.grad_clip, args.patience, args.seed, not args.no_checkpoint)
+                                 args.grad_clip, args.patience, args.seed, not args.no_checkpoint,
+                                 rgb_weight=args.rgb_weight, edge_weight=args.edge_weight,
+                                 ssim_weight=args.ssim_weight, multiscale_weight=args.multiscale_weight,
+                                 feature_weight=args.feature_weight)
             report = train_distillation(args.weights, args.pruning_report, args.train_cache,
                                         args.val_cache, args.out, args.device, config, args.resume, log,
                                         tensorboard=args.tensorboard)

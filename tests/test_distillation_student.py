@@ -10,6 +10,7 @@ from torch import nn
 from dlssnr import int8, quant
 from dlssnr.ablation import layer_macs, units
 from dlssnr.distillation import DistilledStudent, read_pruning_report, validate_pruning
+from dlssnr.distill_losses import FEATURE_BLOCKS
 from dlssnr.io import Controls
 from dlssnr.layers import pre_post, swin, vit, split_swin
 from dlssnr.model import NRNet
@@ -221,6 +222,61 @@ def test_all_152_layers_route_cross_block_skips_and_dropped_tuples_like_inferenc
     expected_gradient, = torch.autograd.grad(expected.sum(), image)
     actual_gradient, = torch.autograd.grad(actual.sum(), image)
     torch.testing.assert_close(actual_gradient, expected_gradient, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("mask", [[1, 2, 23, 31, 47, 69], [3, 24, 32, 46, 68]])
+def test_selective_features_match_capture_and_checkpoint_gradients(mask):
+    plan = build_plan(320, 320)
+    network = _net_from_layers(plan, [_RoutingLayer(spec) for spec in plan])
+    eager = DistilledStudent(copy.deepcopy(network), mask, keep_ratio=1, checkpoint_blocks=False)
+    checked = DistilledStudent(copy.deepcopy(network), mask, keep_ratio=1, checkpoint_blocks=True)
+    network.skip = set(eager.pruning["layer_indices"])
+    x = torch.rand(1, 3, 8, 8, requires_grad=True)
+    captured = {}
+
+    def capture(spec, value):
+        if spec.block in FEATURE_BLOCKS:
+            captured[spec.block] = value[0] if isinstance(value, tuple) else value
+
+    outputs = network.run(x, on_layer=capture)
+    all_outputs = network.run(x, capture=True)
+    assert len(outputs) < len(all_outputs)
+    for spec in plan:
+        if spec.block in FEATURE_BLOCKS:
+            full = all_outputs[spec.index]
+            assert torch.equal(captured[spec.block], full[0] if isinstance(full, tuple) else full)
+    prediction, features = eager(x, return_features=True)
+    checked_prediction, checked_features = checked(x, return_features=True)
+    assert torch.equal(prediction, checked_prediction)
+    assert torch.equal(prediction, outputs[151][..., :5, :7])
+    for block in FEATURE_BLOCKS:
+        assert features[block].requires_grad
+        assert torch.equal(features[block], captured[block])
+        assert torch.equal(features[block], checked_features[block])
+    left = prediction.square().mean() + sum(f.square().mean() for f in features.values())
+    right = checked_prediction.square().mean() + sum(f.square().mean() for f in checked_features.values())
+    torch.testing.assert_close(torch.autograd.grad(left, x)[0], torch.autograd.grad(right, x)[0], rtol=0, atol=0)
+
+
+def test_feature_loss_reaches_real_weights_through_checkpoint(monkeypatch):
+    import dlssnr.distillation as distillation
+    # Use the retained stage of the tiny real Swin graph as the feature tap.
+    monkeypatch.setattr(distillation, "FEATURE_BLOCKS", (2,))
+    eager = DistilledStudent(_small_swin_net(), [1], checkpoint_blocks=False)
+    checked = DistilledStudent(_small_swin_net(), [1], checkpoint_blocks=True)
+    image = torch.rand(1, 3, 8, 8)
+    for model in (eager, checked):
+        _, features = model(image, return_features=True)
+        features[2].square().mean().backward()
+    count = 0
+    for (name, left), (_, right) in zip(eager.named_parameters(), checked.named_parameters()):
+        if left.grad is None:
+            assert right.grad is None
+        else:
+            assert torch.isfinite(left.grad).all(), name
+            torch.testing.assert_close(left.grad, right.grad, rtol=0, atol=0)
+            count += int(torch.count_nonzero(left.grad) > 0)
+    assert count > 0
 
 
 def test_rejects_mutated_masks_experiments_unknown_buffers_and_wrong_inputs(monkeypatch):

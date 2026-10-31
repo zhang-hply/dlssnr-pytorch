@@ -15,7 +15,7 @@ from torch import nn
 
 from dlssnr import distill_train as engine
 from dlssnr.ablation import units
-from dlssnr.distill_data import file_sha256
+from dlssnr.distill_data import FeatureCache, file_sha256
 from dlssnr.io import Controls
 from dlssnr.plan import build_plan
 
@@ -25,7 +25,7 @@ def training(tmp_path, monkeypatch):
     source = tmp_path / "weights.safetensors"
     source.write_bytes(b"tiny source extraction weights")
 
-    def cache(name, values, width=4, height=3):
+    def cache(name, values, width=4, height=3, features=False):
         root = tmp_path / name
         (root / "targets").mkdir(parents=True)
         entries = []
@@ -43,7 +43,18 @@ def training(tmp_path, monkeypatch):
                     "weights_sha256": file_sha256(source), "weights_path": str(source),
                     "controls": asdict(Controls()), "images": entries}
         (root / "manifest.json").write_text(json.dumps(manifest))
+        if features:
+            feature_cache = FeatureCache(root, manifest, prepare=True)
+            for index, value in enumerate(values):
+                tensors = {s.block: torch.full((1, s.c_out, s.out_w, s.out_h), value / 255 * 0.8)
+                           for s in build_plan(width, height) if s.block in engine.FEATURE_BLOCKS}
+                feature_cache.write(index, tensors)
+            feature_cache.finish()
         return root
+
+    def feature_values(tensor, gain, plan):
+        return {s.block: (tensor.mean() * gain).expand(1, s.c_out, s.out_w, s.out_h)
+                for s in plan if s.block in engine.FEATURE_BLOCKS}
 
     class FakeNetwork(nn.Module):
         def __init__(self, width, height):
@@ -53,8 +64,13 @@ def training(tmp_path, monkeypatch):
             self.skip = set()
             self.register_buffer("gain", torch.tensor(0.5))
 
-        def run(self, tensor, controls, capture=False):
+        def run(self, tensor, controls, capture=False, *, on_layer=None):
             assert controls == Controls() and not capture
+            if on_layer is not None:
+                features = feature_values(tensor, self.gain, self.plan)
+                for spec in self.plan:
+                    if spec.block in features:
+                        on_layer(spec, features[spec.block])
             return {self.plan[-1].index: tensor * self.gain}
 
     students = []
@@ -65,15 +81,17 @@ def training(tmp_path, monkeypatch):
         def __init__(self, net, dropped_blocks, checkpoint_blocks=True):
             super().__init__()
             self.width, self.height = net.width, net.height
+            self.plan = net.plan
             self.gain = nn.Parameter(net.gain.detach().clone())
             self.forward_calls = 0
             students.append(self)
 
-        def forward(self, tensor):
+        def forward(self, tensor, *, return_features=False):
             self.forward_calls += 1
             if self.forward_calls == type(self).interrupt_forward:
                 raise KeyboardInterrupt("simulated stop")
-            return tensor[..., :self.height, :self.width] * self.gain
+            prediction = tensor[..., :self.height, :self.width] * self.gain
+            return (prediction, feature_values(tensor, self.gain, self.plan)) if return_features else prediction
 
         def export_state(self):
             return {"gain": self.gain.detach().cpu().clone()}
@@ -87,7 +105,8 @@ def training(tmp_path, monkeypatch):
             "out": tmp_path / "distilled", "pruning": pruning, "cache": cache, "students": students,
             "student_class": FakeStudent,
             "config": engine.TrainConfig(epochs=2, learning_rate=0.05, min_learning_rate=0.01,
-                                          accumulation=2, checkpoint_blocks=False)}
+                                          accumulation=2, checkpoint_blocks=False, ssim_weight=0,
+                                          multiscale_weight=0, feature_weight=0)}
 
 
 def train(settings, **overrides):
@@ -96,6 +115,134 @@ def train(settings, **overrides):
                  "device": "cpu", "config": settings["config"], "log": lambda _: None}
     arguments.update(overrides)
     return engine.train_distillation(**arguments)
+
+
+@pytest.fixture
+def combined_training(training):
+    training["train"] = training["cache"]("feature_train", [40, 70, 100], features=True)
+    training["val"] = training["cache"]("feature_val", [130], features=True)
+    training["config"] = replace(training["config"], ssim_weight=0.1, multiscale_weight=0.1, feature_weight=0.05)
+    return training
+
+
+def test_combined_training_reports_components_and_resumes_identically(combined_training):
+    settings = combined_training
+    uninterrupted_dir = settings["out"].parent / "combined_uninterrupted"
+    report = train(settings, out_dir=uninterrupted_dir)
+    assert report["improved"]
+    for row in report["history"]:
+        for components in (row["loss_components"], row["validation"]["loss_components"]):
+            assert set(components) == {"rgb", "edge", "ssim", "multiscale", "feature", "image_loss", "loss"}
+            expected = components["rgb"] + 0.1 * sum(components[k] for k in ("edge", "ssim", "multiscale")) \
+                + 0.05 * components["feature"]
+            assert components["loss"] == pytest.approx(expected)
+            assert all(np.isfinite(v) for v in components.values())
+    assert report["export_validation"]["loss"] == pytest.approx(report["best"]["loss"])
+    assert report["metadata"]["feature_blocks"] == list(engine.FEATURE_BLOCKS)
+    assert report["metadata"]["train_features_sha256"] == file_sha256(settings["train"] / "features/manifest.json")
+    assert "SSIM loss" in (uninterrupted_dir / "report.md").read_text()
+    settings["student_class"].interrupt_forward = 5
+    with pytest.raises(KeyboardInterrupt):
+        train(settings)
+    settings["student_class"].interrupt_forward = None
+    resumed = train(settings, resume=settings["out"] / "last.pt")
+    assert resumed["best_epoch"] == report["best_epoch"]
+    expected = torch.load(uninterrupted_dir / "last.pt", weights_only=True)
+    actual = torch.load(settings["out"] / "last.pt", weights_only=True)
+    assert torch.equal(actual["student_state"]["gain"], expected["student_state"]["gain"])
+
+
+def test_default_training_requires_features_before_creating_output(training):
+    with pytest.raises(ValueError, match="rerun prepare"):
+        train(training, config=engine.TrainConfig())
+    assert not training["students"] and not training["out"].exists()
+
+
+def test_scene_names_survive_training_and_comparisons_with_duplicate_basenames(training):
+    validation = training["cache"]("nested_validation", [130, 150])
+    manifest_path = validation / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    names = ["scene1/frame.png", "scene2/frame.png"]
+    for entry, name in zip(manifest["images"], names):
+        original = Path(entry["input_path"])
+        nested = original.parent / name
+        nested.parent.mkdir()
+        original.rename(nested)
+        entry.update(name=name, input_path=str(nested))
+    manifest_path.write_text(json.dumps(manifest))
+    report = train(training, val_cache=validation)
+    assert [item["name"] for item in report["baseline"]["per_image"]] == names
+    images_out = training["out"] / "comparisons"
+    evaluation = engine.evaluate_export(training["source"], training["out"] / "best.safetensors",
+                                        validation, device="cpu", log=lambda _: None, images_out=images_out)
+    images = evaluation["comparisons"]["images"]
+    assert [item["name"] for item in images] == names
+    assert len({item["file"] for item in images}) == 2
+    assert all((images_out / item["file"]).is_file() for item in images)
+
+
+def test_new_export_evaluates_rgb_only_cache_with_unavailable_total(combined_training):
+    settings = combined_training
+    train(settings)
+    rgb_only = settings["cache"]("rgb_only_evaluation", [160])
+    metrics = engine.evaluate_export(settings["source"], settings["out"] / "best.safetensors",
+                                     rgb_only, device="cpu", log=lambda _: None)["metrics"]
+    assert metrics["loss"] is None and metrics["loss_components"]["feature"] is None
+    assert not metrics["feature_loss_available"]
+    assert metrics["image_loss"] > 0 and np.isfinite(metrics["psnr_db"])
+
+
+def test_old_checkpoint_resumes_with_legacy_objective_and_old_export_loads(training):
+    train(training)
+    path = training["out"] / "last.pt"
+    checkpoint = torch.load(path, weights_only=True)
+    for key in asdict(engine.LossWeights()):
+        checkpoint["metadata"]["config"].pop(key)
+    for key in ("train_features_sha256", "val_features_sha256", "feature_blocks"):
+        checkpoint["metadata"].pop(key)
+    torch.save(checkpoint, path)
+    metadata_path = training["out"] / "best.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata["config"] = checkpoint["metadata"]["config"]
+    metadata_path.write_text(json.dumps(metadata))
+    resumed = train(training, resume=path)
+    assert resumed["status"] == "completed"
+    assert resumed["metadata"]["config"]["feature_weight"] == 0
+    assert resumed["export_validation"]["loss"] is not None
+    with pytest.raises(ValueError, match="different config"):
+        train(training, resume=path, config=replace(training["config"], ssim_weight=0.1))
+
+
+def test_resume_rejects_feature_fingerprint_changes(combined_training):
+    settings = combined_training
+    train(settings)
+    manifest = settings["train"] / "features/manifest.json"
+    # Whitespace changes preserve semantic validity but change the recorded artifact identity.
+    manifest.write_text(manifest.read_text() + "\n")
+    with pytest.raises(ValueError, match="different train_features_sha256"):
+        train(settings, resume=settings["out"] / "last.pt")
+
+
+def test_feature_cache_reused_with_another_mask(combined_training):
+    settings = combined_training
+    first = train(settings)
+    mask = first["metadata"]["dropped_blocks"][:-1]
+    engine.validate_pruning(build_plan(4, 3), mask)
+    pruning = settings["out"].parent / "another_mask.json"
+    pruning.write_text(json.dumps({"best": {"blocks": mask}}))
+    second = train(settings, pruning_report=pruning, out_dir=settings["out"].parent / "another_student")
+    assert first["metadata"]["train_features_sha256"] == second["metadata"]["train_features_sha256"]
+
+
+def test_combined_tensorboard_components_match_reports(combined_training, events):
+    report = train(combined_training, tensorboard=True)
+    result = events(combined_training["out"])
+    for key in ("rgb", "edge", "ssim", "multiscale", "feature", "image_loss", "loss"):
+        assert [e.value for e in result.Scalars(f"train/components_epoch/{key}")] == pytest.approx(
+            [row["loss_components"][key] for row in report["history"]])
+        assert result.Scalars(f"val/loss_components/{key}")[-1].value == pytest.approx(
+            report["history"][-1]["validation"]["loss_components"][key])
+        assert len(result.Scalars(f"train/components_step/{key}")) == 4
 
 
 def test_training_improves_baseline_exports_and_reloads(training):
@@ -382,13 +529,13 @@ def events():
 def test_tensorboard_records_metrics_groups_and_original_images(training, monkeypatch, events):
     training["val"] = training["cache"]("visual_validation", [130, 140, 150, 160])
     losses, inference_calls = [], []
-    original_loss, original_network = engine.distillation_loss, engine._new_network
+    original_loss, original_network = engine.loss_components, engine._new_network
 
-    def record_loss(prediction, target):
-        loss = original_loss(prediction, target)
+    def record_loss(*args, **kwargs):
+        terms = original_loss(*args, **kwargs)
         if torch.is_grad_enabled():
-            losses.append(float(loss.detach()))
-        return loss
+            losses.append(float(terms["loss"].detach()))
+        return terms
 
     def record_network(*args):
         net = original_network(*args)
@@ -401,7 +548,7 @@ def test_tensorboard_records_metrics_groups_and_original_images(training, monkey
         net.run = run
         return net
 
-    monkeypatch.setattr(engine, "distillation_loss", record_loss)
+    monkeypatch.setattr(engine, "loss_components", record_loss)
     monkeypatch.setattr(engine, "_new_network", record_network)
     report = train(training, tensorboard=True, config=replace(training["config"], grad_clip=0.01))
     result = events(training["out"])

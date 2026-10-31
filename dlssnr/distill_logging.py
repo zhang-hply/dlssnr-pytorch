@@ -29,8 +29,10 @@ def write_scalar(writer, tag: str, value, step: int) -> None:
 
 
 def write_metrics(writer, prefix: str, metrics: dict, step: int) -> None:
-    for key in ("loss", "mse", "psnr_db", "mse_uint8", "psnr_uint8_db", "ssim"):
+    for key in ("loss", "image_loss", "mse", "psnr_db", "mse_uint8", "psnr_uint8_db", "ssim"):
         write_scalar(writer, f"{prefix}/{key}", metrics.get(key), step)
+    for key, value in metrics.get("loss_components", {}).items():
+        write_scalar(writer, f"{prefix}/loss_components/{key}", value, step)
 
 
 def image_callback(writer, prefix: str, step: int):
